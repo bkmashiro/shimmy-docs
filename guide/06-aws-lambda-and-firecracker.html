@@ -7,7 +7,7 @@
     <meta name="description" content="A VitePress site">
     <link rel="stylesheet" href="/assets/style.58be8173.css">
     <link rel="modulepreload" href="/assets/app.9bbe1412.js">
-    <link rel="modulepreload" href="/assets/guide_06-aws-lambda-and-firecracker.md.eb3bd57d.lean.js">
+    <link rel="modulepreload" href="/assets/guide_06-aws-lambda-and-firecracker.md.a53f6c85.lean.js">
     
     <script id="check-dark-light">(()=>{const e=localStorage.getItem("vitepress-theme-appearance")||"",a=window.matchMedia("(prefers-color-scheme: dark)").matches;(!e||e==="auto"?a:e==="dark")&&document.documentElement.classList.add("dark")})();</script>
   </head>
@@ -167,7 +167,7 @@
 <span class="line"><span style="color:#A6ACCD;">    </span><span style="color:#F07178;">environment</span><span style="color:#89DDFF;">:</span></span>
 <span class="line"><span style="color:#A6ACCD;">      </span><span style="color:#F07178;">SHIMMY_ENABLED</span><span style="color:#89DDFF;">:</span><span style="color:#A6ACCD;"> </span><span style="color:#89DDFF;">&quot;</span><span style="color:#C3E88D;">true</span><span style="color:#89DDFF;">&quot;</span></span>
 <span class="line"></span></code></pre></div><h2 id="_6-9-环境变量泄露-为什么需要清理" tabindex="-1">6.9 环境变量泄露：为什么需要清理 <a class="header-anchor" href="#_6-9-环境变量泄露-为什么需要清理" aria-hidden="true">#</a></h2><p>Lambda 通过环境变量向函数传递 AWS 凭证：</p><div class="language-"><button title="Copy Code" class="copy"></button><span class="lang"></span><pre class="shiki"><code><span class="line"><span style="color:#A6ACCD;"># Lambda 函数看到的典型环境变量（通过 /proc/self/environ）</span></span>
-<span class="line"><span style="color:#A6ACCD;">AWS_ACCESS_KEY_ID=ASIAIOSFODNN7EXAMPLE</span></span>
+<span class="line"><span style="color:#A6ACCD;">AWS_ACCESS_KEY_ID=ASIA_EXAMPLE_KEY_XXXX</span></span>
 <span class="line"><span style="color:#A6ACCD;">AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY</span></span>
 <span class="line"><span style="color:#A6ACCD;">AWS_SESSION_TOKEN=AQoDYXdzEJr...（很长）</span></span>
 <span class="line"><span style="color:#A6ACCD;">AWS_REGION=us-east-1</span></span>
@@ -232,7 +232,7 @@
 <span class="line"><span style="color:#A6ACCD;">  → rlimits（Proto A）</span></span>
 <span class="line"><span style="color:#A6ACCD;">  → DynamoRIO（Proto D）：用户态机器码级拦截</span></span>
 <span class="line"><span style="color:#A6ACCD;"></span></span></code></pre></div><p>下一章开始进入 Shimmy Sandbox 的核心技术：二进制插桩——一种完全在用户态运行、不需要任何特殊内核权限的系统调用拦截技术。</p></div></div></main><!--[--><!--]--><!----><!--[--><!--]--></div></div></div></div></div><!----><!--[--><!--]--></div></div>
-    <script>__VP_HASH_MAP__ = JSON.parse("{\"guide_01-what-is-a-program.md\":\"8af427ab\",\"guide_02-linux-and-the-kernel.md\":\"95780a95\",\"guide_03-system-calls.md\":\"ae5657d0\",\"guide_04-why-syscalls-are-dangerous.md\":\"ab2f1ba7\",\"guide_05-traditional-sandboxing.md\":\"557bc621\",\"guide_06-aws-lambda-and-firecracker.md\":\"eb3bd57d\",\"guide_07-binary-instrumentation.md\":\"3f9b925c\",\"guide_08-dynamorio-deep-dive.md\":\"8eeabb9c\",\"guide_09-five-prototypes.md\":\"df49a8ae\",\"guide_10-shimmy-architecture.md\":\"2ab4d7d6\",\"guide_11-benchmark-analysis.md\":\"9449bb65\",\"guide_12-future-directions.md\":\"de115927\",\"index.md\":\"e790f4af\"}")</script>
+    <script>__VP_HASH_MAP__ = JSON.parse("{\"guide_01-what-is-a-program.md\":\"8af427ab\",\"guide_02-linux-and-the-kernel.md\":\"95780a95\",\"guide_03-system-calls.md\":\"ae5657d0\",\"guide_04-why-syscalls-are-dangerous.md\":\"7d47eefc\",\"guide_05-traditional-sandboxing.md\":\"557bc621\",\"guide_06-aws-lambda-and-firecracker.md\":\"a53f6c85\",\"guide_07-binary-instrumentation.md\":\"3f9b925c\",\"guide_08-dynamorio-deep-dive.md\":\"8eeabb9c\",\"guide_09-five-prototypes.md\":\"df49a8ae\",\"guide_10-shimmy-architecture.md\":\"2ab4d7d6\",\"guide_11-benchmark-analysis.md\":\"9449bb65\",\"guide_12-future-directions.md\":\"de115927\",\"index.md\":\"e790f4af\"}")</script>
     <script type="module" async src="/assets/app.9bbe1412.js"></script>
     
   </body>
