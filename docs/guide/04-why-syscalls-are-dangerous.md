@@ -124,7 +124,7 @@ int main() {
 
 **预期输出**（在真实 Lambda 环境中）：
 ```
-发现凭证: AWS_ACCESS_KEY_ID=ASIAIOSFODNN7EXAMPLE
+发现凭证: AWS_ACCESS_KEY_ID=ASIA_EXAMPLE_KEY_XXXX
 发现凭证: AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 发现凭证: AWS_SESSION_TOKEN=AQoDYXdzEJr...（很长的临时 token）
 发现凭证: AWS_REGION=us-east-1
@@ -133,7 +133,7 @@ int main() {
 获得这些凭证后，攻击者可以：
 ```bash
 # 在自己的机器上使用偷来的凭证
-export AWS_ACCESS_KEY_ID=ASIAIOSFODNN7EXAMPLE
+export AWS_ACCESS_KEY_ID=ASIA_EXAMPLE_KEY_XXXX
 export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/...
 export AWS_SESSION_TOKEN=AQoDYXdzEJr...
 
