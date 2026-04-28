@@ -68,6 +68,19 @@ export default defineConfig({
         ]
       },
       {
+        text: '汇编语言入门',
+        items: [
+          { text: '第一章：为什么要学汇编？', link: '/assembly/01-why-assembly' },
+          { text: '第二章：CPU 和寄存器', link: '/assembly/02-cpu-and-registers' },
+          { text: '第三章：内存布局与栈', link: '/assembly/03-memory-and-stack' },
+          { text: '第四章：基本指令', link: '/assembly/04-basic-instructions' },
+          { text: '第五章：调用约定（ABI）', link: '/assembly/05-calling-convention' },
+          { text: '第六章：用汇编发起系统调用', link: '/assembly/06-syscalls-in-assembly' },
+          { text: '第七章：读懂反汇编输出', link: '/assembly/07-reading-disassembly' },
+          { text: '第八章：汇编与沙箱技术的联系', link: '/assembly/08-assembly-and-sandboxing' },
+        ]
+      },
+      {
         text: 'SoK Paper',
         items: [
           { text: 'Overview (500 words)', link: '/sok/overview' },
