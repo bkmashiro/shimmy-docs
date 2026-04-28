@@ -65,6 +65,14 @@ export default defineConfig({
           { text: '信号与异常', link: '/concepts/os/signals-and-exceptions' },
           { text: '虚拟内存进阶', link: '/concepts/os/virtual-memory-advanced' },
           { text: 'ABI、链接与动态库', link: '/concepts/os/abi-and-linking' },
+          { text: '什么是沙箱？', link: '/concepts/security/what-is-sandboxing' },
+          { text: 'seccomp 与 eBPF', link: '/concepts/security/seccomp-and-ebpf' },
+          { text: '动态二进制插桩（DBI）', link: '/concepts/security/dbi-and-instrumentation' },
+          { text: 'WebAssembly 与语言级沙箱', link: '/concepts/security/wasm-and-language-sandboxing' },
+          { text: 'JIT 编译', link: '/concepts/security/jit-compilation' },
+          { text: '虚拟机与 Hypervisor', link: '/concepts/security/hypervisors-and-vms' },
+          { text: 'Trampoline 技术', link: '/concepts/security/trampoline-techniques' },
+          { text: '攻击面分析', link: '/concepts/security/attack-surfaces' },
         ]
       },
       {
