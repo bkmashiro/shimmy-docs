@@ -56,6 +56,18 @@ export default defineConfig({
         ]
       },
       {
+        text: '核心概念',
+        items: [
+          { text: '进程与内存空间', link: '/concepts/os/process-and-memory' },
+          { text: '内核态与用户态', link: '/concepts/os/kernel-userspace' },
+          { text: '系统调用深度解析', link: '/concepts/os/syscall-deep-dive' },
+          { text: 'Linux 命名空间与 cgroups', link: '/concepts/os/linux-namespaces-cgroups' },
+          { text: '信号与异常', link: '/concepts/os/signals-and-exceptions' },
+          { text: '虚拟内存进阶', link: '/concepts/os/virtual-memory-advanced' },
+          { text: 'ABI、链接与动态库', link: '/concepts/os/abi-and-linking' },
+        ]
+      },
+      {
         text: 'SoK Paper',
         items: [
           { text: 'Overview (500 words)', link: '/sok/overview' },
