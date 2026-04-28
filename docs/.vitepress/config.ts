@@ -8,7 +8,10 @@ export default defineConfig({
 
   themeConfig: {
     nav: [
-      { text: '指南', link: '/guide/01-what-is-a-program' }
+      { text: '指南', link: '/guide/01-what-is-a-program' },
+      { text: 'Papers', link: '/papers/zpoline' },
+      { text: 'Research', link: '/research/approaches-survey' },
+      { text: 'SoK', link: '/sok/overview' },
     ],
 
     sidebar: [
@@ -28,7 +31,37 @@ export default defineConfig({
           { text: '第十一章：基准测试分析', link: '/guide/11-benchmark-analysis' },
           { text: '第十二章：未来方向与研究展望', link: '/guide/12-future-directions' },
         ]
-      }
+      },
+      {
+        text: 'Papers',
+        items: [
+          { text: 'zpoline (ATC 2023)', link: '/papers/zpoline' },
+          { text: 'lazypoline (DSN 2024)', link: '/papers/lazypoline' },
+          { text: 'K23 / Clair Obscur (Middleware 2025)', link: '/papers/k23' },
+          { text: 'Firecracker (NSDI 2020)', link: '/papers/firecracker' },
+          { text: 'Faasm (ATC 2020)', link: '/papers/faasm' },
+          { text: 'SigmaOS (SOSP 2024)', link: '/papers/sigmaos' },
+          { text: 'Dandelion (SOSP 2025)', link: '/papers/dandelion' },
+          { text: 'Enclosure (ASPLOS 2021)', link: '/papers/enclosure' },
+          { text: 'Light-Weight Contexts (OSDI 2016)', link: '/papers/light-weight-contexts' },
+          { text: 'Seccomp-eBPF (arXiv 2023)', link: '/papers/seccomp-ebpf' },
+        ]
+      },
+      {
+        text: 'Research',
+        items: [
+          { text: 'Approaches Survey', link: '/research/approaches-survey' },
+          { text: 'What Works in Lambda', link: '/research/what-works' },
+          { text: 'Annotated Bibliography', link: '/research/annotated-bibliography' },
+        ]
+      },
+      {
+        text: 'SoK Paper',
+        items: [
+          { text: 'Overview (500 words)', link: '/sok/overview' },
+          { text: 'Full Paper', link: '/sok/full' },
+        ]
+      },
     ],
 
     outline: {

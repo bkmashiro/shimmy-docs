@@ -54,3 +54,14 @@ features:
 | [第十章](/guide/10-shimmy-architecture) | Shimmy 完整系统架构 | ⭐⭐⭐⭐ 高级 |
 | [第十一章](/guide/11-benchmark-analysis) | 基准测试分析与解读 | ⭐⭐⭐⭐⭐ 专家 |
 | [第十二章](/guide/12-future-directions) | 未来方向与改进空间 | ⭐⭐⭐⭐⭐ 专家 |
+
+## Research Reference
+
+| Section | Contents |
+|---------|---------|
+| [Papers](/papers/zpoline) | Paper notes for 10 key systems papers (zpoline, lazypoline, K23, Firecracker, Faasm, SigmaOS, Dandelion, Enclosure, lwC, Seccomp-eBPF) |
+| [Approaches Survey](/research/approaches-survey) | Every way to sandbox untrusted code inside AWS Lambda — 14 approaches evaluated, 8 viable, 6 blocked |
+| [What Works in Lambda](/research/what-works) | Confirmed blocked/available primitives, practical techniques, tiered architecture recommendations |
+| [Annotated Bibliography](/research/annotated-bibliography) | Path-specific paper citations mapping Paths A–E to their research lineage |
+| [SoK Overview](/sok/overview) | 500-word synthesis: the nested sandboxing problem, taxonomy, five implementation paths |
+| [SoK Full Paper](/sok/full) | Complete SoK paper: Sandboxing Untrusted Code in Constrained Serverless Environments |
