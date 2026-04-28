@@ -1,114 +1,137 @@
-# Dandelion: Unlocking True Elasticity for the Cloud-Native Era
+# Dandelion：释放云原生时代的真正弹性
 
-**Authors:** Tom Kuchler, Pinghe Li, Yazhuo Zhang, Lazar Cvetković, Boris Goranov, Tobias Stocker, Leon Thomm, Simone Kalbermatter, Tim Notter, Andrea Lattuada, Ana Klimovic (ETH Zurich / MPI-SWS)  **Venue:** SOSP  **Year:** 2025
+**作者：** Tom Kuchler, Pinghe Li, Yazhuo Zhang, Lazar Cvetković, Boris Goranov, Tobias Stocker, Leon Thomm, Simone Kalbermatter, Tim Notter, Andrea Lattuada, Ana Klimovic（ETH Zurich / MPI-SWS）  **发表于：** SOSP  **年份：** 2025
 
-## Summary
+---
 
-Dandelion is a cloud-native elastic compute platform whose core insight is that decomposing applications into pure compute functions (no syscalls) and communication functions (platform-provided I/O) eliminates the need for guest OS and network configuration — the root cause of slow cold starts. This reduces sandbox cold starts to hundreds of microseconds, cuts committed memory by 96% vs. Knative on Azure workloads, and reduces latency variance by 2–3 orders of magnitude. Dandelion implements four isolation backends: KVM (889 μs cold start), Process (486 μs), CHERI (89 μs), and rWasm (241 μs).
+## 前置知识
 
-## Key Ideas
+- 了解无服务器计算的基本概念
+- 知道 POSIX 是什么——Linux 提供给程序的标准接口（文件系统、网络、进程）
+- 理解什么是冷启动（cold start）
 
-- **Pure compute functions**: User-provided functions that cannot issue syscalls, access the network, or create threads — they only consume declared input sets and produce declared output sets. The platform can sandbox these in an extremely lightweight container with no guest OS.
-- **Communication functions**: Platform-provided I/O primitives (currently HTTP). Users can call but not modify them. They run in trusted execution without a sandbox.
-- **DAG programming model**: A Dandelion composition is a directed graph of compute and communication functions with typed data edges specifying distribution semantics (`all`, `each`, `key`).
-- **Four isolation backends**: KVM (hardware virtualization, no guest kernel), Process (ptrace-blocked), CHERI (in-process capability hardware), rWasm (Wasm-to-safe-Rust, compile-time isolation). Same dispatcher works with all backends.
-- **PI-controller for compute/communication balance**: A proportional-integral controller measures queue growth rates every 30 ms and dynamically reallocates CPU cores between compute engines (run-to-completion) and communication engines (cooperative multithreading).
-- **dlibc**: A custom C standard library that provides standard interfaces (malloc, file operations) backed by an in-memory virtual filesystem, without issuing syscalls.
+## 你将学到
 
-## Relevance to Shimmy
+- 为什么 POSIX 是冷启动延迟的根本原因
+- 什么是"纯计算函数"与"通信函数"的分离设计
+- Dandelion 的四种隔离后端各有什么特点
+- CHERI 硬件能力如何实现进程内隔离
 
-Dandelion's core lesson is that POSIX is the enemy of cold-start performance. Guest OS loading and network configuration dominate Firecracker's snapshot cold-start time (>8 ms of the total). For Shimmy, this motivates a layered design: functions that only need to compute (e.g., student algorithm solutions) can run in an ultra-lightweight sandbox with no POSIX exposure, achieving sub-millisecond cold starts. Dandelion's pluggable backend architecture also demonstrates how a single scheduler can front multiple isolation mechanisms — relevant for Shimmy's tiered approach (Lambda mode vs. self-hosted). The 96% memory reduction achieved by eliminating pre-warming aligns directly with Shimmy's cost model: if cold starts are cheap enough, pre-warming becomes unnecessary.
+---
 
-## Detailed Notes
+## 摘要
 
-### Problem & Motivation
+Dandelion 是一个云原生弹性计算平台，其核心洞见是：将应用分解为纯计算函数（无系统调用）和通信函数（平台提供的 I/O），消除了对客户机操作系统和网络配置的需求——这是冷启动慢的根本原因。这将沙箱冷启动时间减少到数百微秒，在 Azure 工作负载上将已提交内存削减 96%（对比 Knative），并将延迟方差降低 2–3 个数量级。Dandelion 实现了四种隔离后端：KVM（冷启动 889 μs）、Process（486 μs）、CHERI（89 μs）和 rWasm（241 μs）。
 
-Serverless platforms achieve elasticity through rapid sandbox creation, but current approaches are fundamentally bottlenecked:
+## 核心思想
 
-- **Cold start**: Firecracker snapshot restoration takes >10 ms, with >8 ms spent loading the guest OS snapshot and rebuilding the guest-host network connection — solely to provide a POSIX-like interface to user functions
-- **Memory overprovisioning**: Keeping warm containers ready for burst traffic means platforms allocate 16× more memory than active requests actually need (measured on Azure Functions production trace with Knative autoscaling)
-- **High tail latency**: Even when 97% of requests hit warm sandboxes, the 3% cold-start tail dominates p99 latency
+> **💡 什么是 POSIX？**
+> POSIX 是一套标准接口规范，定义了程序如何与操作系统交互——打开文件、建立网络连接、创建子进程等。大多数 Linux 程序默认需要 POSIX 环境。但云原生函数（如评测代码）往往只需要"计算"，不需要文件系统、网络或进程管理。Dandelion 的洞见是：强迫函数运行在完整 POSIX 环境中，等于让用户为自己不需要的功能付出延迟代价。
 
-**Root cause**: Current FaaS platforms unnecessarily expose a full POSIX environment to user functions. Cloud-native applications don't need it.
+- **纯计算函数**：不能发起系统调用、访问网络或创建线程的用户提供函数——只消耗声明的输入集，生成声明的输出集。平台可以在没有客户机操作系统的超轻量级容器中对这些函数进行沙箱处理。
+- **通信函数**：平台提供的 I/O 原语（当前为 HTTP）。用户可以调用但不能修改。在可信执行环境中运行，无需沙箱。
+- **DAG 编程模型**：Dandelion 组合是一个由计算和通信函数构成的有向图，带有指定分布语义（`all`、`each`、`key`）的类型化数据边。
+- **四种隔离后端**：KVM（硬件虚拟化，无客户机内核）、Process（ptrace 阻塞）、CHERI（进程内能力硬件）、rWasm（Wasm 转安全 Rust，编译时隔离）。同一调度器适用所有后端。
+- **用于计算/通信平衡的 PI 控制器**：比例积分控制器每 30 ms 测量一次队列增长速率，并在计算引擎（运行至完成）和通信引擎（协作多线程）之间动态重新分配 CPU 核心。
+- **dlibc**：一个自定义 C 标准库，提供标准接口（malloc、文件操作），由内存中虚拟文件系统支持，不发起系统调用。
 
-### Design & Architecture
+## 与 Shimmy 的关联
 
-**Programming model**: A composition is a directed graph G = (V, E):
-- **Compute functions**: User code, no syscalls, no network, no threads. Receives input sets (folders), produces output sets.
-- **Communication functions**: Platform-provided I/O (HTTP). Verified and sanitized by the platform.
-- **Edges**: `(V1, V2, M)` where M specifies distribution: `all` (all items to single instance), `each` (each item to independent instance), `key` (grouped by key).
+Dandelion 的核心经验是 POSIX 是冷启动性能的敌人。客户机操作系统加载和网络配置占据了 Firecracker 快照冷启动时间的大部分（总时间中超过 8 ms）。对于 Shimmy，这激励了分层设计：只需计算的函数（如学生算法解答）可以在没有 POSIX 暴露的超轻量级沙箱中运行，实现亚毫秒级冷启动。Dandelion 的可插拔后端架构也展示了单个调度器如何对接多种隔离机制——与 Shimmy 的分层方案（Lambda 模式 vs. 自托管）相关。消除预热后实现的 96% 内存减少与 Shimmy 的成本模型直接契合：如果冷启动足够廉价，预热就变得不必要。
 
-**dlibc/dlibc++**: Custom C standard library providing malloc, local filesystem operations, math — backed by an in-memory virtual filesystem. Syscalls for mmap, mprotect, socket, and threads have stub implementations that return appropriate error codes.
+## 详细说明
 
-**Worker node components**:
-- **Dispatcher**: Maintains DAG registry, tracks input/output dependencies, prepares isolated memory contexts, queues ready functions
-- **Memory Context**: Bounded, contiguous memory region; uses virtual memory reservation + demand paging for zero-filled pages
-- **Compute Engines**: One task to completion per engine; minimizes interference and context switches
-- **Communication Engines**: Trusted; cooperative multithreading (green threads) on dedicated cores
+### 问题与动机
 
-**Four isolation backends**:
+无服务器平台通过快速创建沙箱实现弹性，但当前方案从根本上受到瓶颈限制：
 
-| Backend | Cold Start | Mechanism |
+- **冷启动**：Firecracker 快照恢复需要 >10 ms，其中 >8 ms 花在加载客户机操作系统快照和重建客户机-宿主机网络连接上——这些完全是为了给用户函数提供类 POSIX 接口
+- **内存超额分配**：为突发流量保持预热容器意味着平台分配的内存是活跃请求实际需要的 16×（在 Azure Functions 生产跟踪上用 Knative 自动扩缩容测量）
+- **高尾延迟**：即使 97% 的请求命中预热沙箱，3% 的冷启动尾部也主导了 p99 延迟
+
+**根本原因**：当前 FaaS 平台不必要地向用户函数暴露完整的 POSIX 环境。云原生应用并不需要它。
+
+### 设计与架构
+
+**编程模型**：组合是有向图 G = (V, E)：
+- **计算函数**：用户代码，无系统调用、无网络、无线程。接收输入集（文件夹），生成输出集。
+- **通信函数**：平台提供的 I/O（HTTP）。由平台验证和清理。
+- **边**：`(V1, V2, M)`，其中 M 指定分发方式：`all`（所有项目到单个实例）、`each`（每个项目到独立实例）、`key`（按键分组）。
+
+**dlibc/dlibc++**：提供 malloc、本地文件系统操作、数学的自定义 C 标准库——由内存中虚拟文件系统支持。mmap、mprotect、socket 和线程的系统调用有桩实现，返回适当的错误码。
+
+**工作节点组件**：
+- **调度器**：维护 DAG 注册表，追踪输入/输出依赖，准备隔离内存上下文，对就绪函数排队
+- **内存上下文**：有界的连续内存区域；使用虚拟内存预留 + 按需分页（零填充页面）
+- **计算引擎**：每引擎一个任务运行至完成；最小化干扰和上下文切换
+- **通信引擎**：可信；专用核心上的协作多线程（绿色线程）
+
+**四种隔离后端**：
+
+> **💡 什么是 CHERI 硬件能力？**
+> CHERI（Capability Hardware Enhanced RISC Instructions）是一种处理器架构扩展，将"能力"（能访问哪块内存、以何种权限）直接编码在指针中。普通指针只是一个数字（内存地址），可以被随意修改。CHERI 指针带有防篡改的权限标签，CPU 在每次内存访问时验证这些标签——从硬件层面实现进程内隔离，比软件检查快得多。
+
+| 后端 | 冷启动 | 机制 |
 |---------|-----------|-----------|
-| CHERI | 89 μs | Capability hardware — user code runs as a thread in the Dandelion process; CHERI capabilities provide in-address-space isolation |
-| rWasm | 241 μs | Wasm-to-safe-Rust compiler; isolation enforced at compile time by Rust's memory safety |
-| Process | 486 μs | Separate process with ptrace blocking all syscalls from the compute function |
-| KVM | 889 μs | Hardware VM with no guest kernel; identity-mapped guest physical address space; reuses KVM structures to skip VM setup overhead |
+| CHERI | 89 μs | 能力硬件——用户代码作为 Dandelion 进程中的线程运行；CHERI 能力提供进程内地址空间隔离 |
+| rWasm | 241 μs | Wasm 转安全 Rust 编译器；隔离通过 Rust 内存安全在编译时强制 |
+| Process | 486 μs | 独立进程，ptrace 阻塞计算函数的所有系统调用 |
+| KVM | 889 μs | 无客户机内核的硬件虚拟机；身份映射客户机物理地址空间；复用 KVM 结构以跳过虚拟机设置开销 |
 
-**Control plane**: PI controller measures compute/communication queue growth rates every 30 ms, reallocates CPU cores accordingly. This dynamic separation of compute and I/O enables stable performance under mixed workloads.
+**控制平面**：PI 控制器每 30 ms 测量计算/通信队列增长速率，相应重新分配 CPU 核心。计算和 I/O 的动态分离在混合工作负载下实现稳定性能。
 
-### Evaluation
+### 评估
 
-**Hardware**: 2× Intel Xeon E5-2630v3, 16 physical cores, 256 GiB DRAM. CHERI experiments on Arm Morello board (4 cores, 16 GiB). Azure trace experiments on CloudLab d430.
+**硬件**：2× Intel Xeon E5-2630v3，16 个物理核心，256 GiB DRAM。CHERI 实验在 Arm Morello 板（4 核，16 GiB）上进行。Azure 跟踪实验在 CloudLab d430 上进行。
 
-**Sandbox creation latency** (Morello board, 1×1 matrix multiply):
+**沙箱创建延迟**（Morello 板，1×1 矩阵乘法）：
 
-| Backend | Total latency (μs) |
+| 后端 | 总延迟（μs）|
 |---------|--------------------|
 | CHERI | 89 |
 | rWasm | 241 |
 | Process | 486 |
 | KVM | 889 |
 
-For comparison: Firecracker cold start >150 ms, Firecracker snapshot max 120 RPS; Wasmtime with pooled allocation ~7000 RPS.
+对比：Firecracker 冷启动 >150 ms，Firecracker 快照最大 120 RPS；Wasmtime 带池化分配约 7000 RPS。
 
-**Matrix multiply (128×128, 16-core server)**:
-- Dandelion KVM backend: 4800 RPS peak; creates new sandbox per request with stable latency
-- Firecracker (97% warm): unstable after 2800 RPS due to CPU contention; peak 3000 RPS
+**矩阵乘法（128×128，16 核服务器）**：
+- Dandelion KVM 后端：峰值 4800 RPS；每个请求创建新沙箱，延迟稳定
+- Firecracker（97% 预热）：2800 RPS 后因 CPU 竞争不稳定；峰值 3000 RPS
 
-**Mixed workload (log processing + image compression)**:
-- Dandelion: avg/p99 latency variance 1.3%/2.9%
-- Firecracker: 389%/1495% variance (bimodal due to cold starts)
-- Wasmtime: 6.1%/79.2% variance
+**混合工作负载（日志处理 + 图像压缩）**：
+- Dandelion：平均/p99 延迟方差 1.3%/2.9%
+- Firecracker：389%/1495% 方差（因冷启动导致双峰分布）
+- Wasmtime：6.1%/79.2% 方差
 
-**Azure Functions trace replay** (100 functions, CloudLab cluster):
-- Firecracker + Knative: average committed memory 2619 MB
-- Dandelion (process backend): average committed memory **109 MB** (only 4%)
-- Dandelion p99 end-to-end latency 46% lower than Firecracker
+**Azure Functions 跟踪回放**（100 个函数，CloudLab 集群）：
+- Firecracker + Knative：平均已提交内存 2619 MB
+- Dandelion（进程后端）：平均已提交内存 **109 MB**（仅 4%）
+- Dandelion p99 端到端延迟比 Firecracker 低 46%
 
-**SSB query processing vs. AWS Athena** (EC2 m7a.8xlarge, Apache Arrow Acero):
-- Latency reduced 40%, cost reduced 67% for short queries
+**SSB 查询处理 vs. AWS Athena**（EC2 m7a.8xlarge，Apache Arrow Acero）：
+- 短查询延迟降低 40%，成本降低 67%
 
-### Security Analysis
+### 安全分析
 
-- **Attack surface**: Compute functions have no access to syscalls during execution; output parser is 100 lines of Rust (auditable)
-- **TCB comparison**: Dandelion ~12K lines Rust (of which ~2K lines directly related to isolation); Firecracker ~68K lines Rust; gVisor ~38K lines Go
+- **攻击面**：计算函数在执行期间无法访问系统调用；输出解析器为 100 行 Rust（可审计）
+- **TCB 对比**：Dandelion 约 1.2 万行 Rust（其中约 2K 行直接与隔离相关）；Firecracker 约 6.8 万行 Rust；gVisor 约 3.8 万行 Go
 
-### Limitations
+### 局限
 
-1. **Programming model restrictions**: Not suitable for OLTP, online games, fine-grained shared-memory algorithms; pure compute functions cannot issue syscalls, create threads, or open sockets
-2. **Data copy overhead**: Current implementation copies data between contexts; future work: memory remapping or COW
-3. **Language support**: Currently C/C++ SDK and CPython; planned LLVM extension for more languages
-4. **Manual application splitting**: Developers must manually decompose apps into compute/communication functions
-5. **rWasm overhead**: Transpiled code is less efficient than native compilation for compute-intensive tasks
+1. **编程模型限制**：不适用于 OLTP、在线游戏、细粒度共享内存算法；纯计算函数不能发起系统调用、创建线程或打开套接字
+2. **数据复制开销**：当前实现在上下文间复制数据；未来工作：内存重映射或写时复制
+3. **语言支持**：当前支持 C/C++ SDK 和 CPython；计划通过 LLVM 扩展支持更多语言
+4. **手动应用拆分**：开发者必须手动将应用分解为计算/通信函数
+5. **rWasm 开销**：转译代码对计算密集型任务效率低于原生编译
 
-### Glossary
+### 术语表
 
-- **Pure compute function**: User code that issues no syscalls, performs no I/O, only consumes declared inputs and produces declared outputs
-- **Communication function**: Platform-provided I/O primitive (e.g., HTTP), trusted, runs outside the sandbox
-- **dlibc**: Dandelion's custom C standard library backed by an in-memory virtual filesystem, no syscalls required
-- **Memory context**: Bounded contiguous memory region allocated for each function invocation
-- **CHERI**: Capability Hardware Enhanced RISC Instructions — in-process isolation via hardware capabilities
-- **rWasm**: Wasm-to-safe-Rust compiler; compile-time isolation enforced by Rust's memory safety guarantees
-- **Green threads**: Cooperative user-space threads, not depending on OS scheduling
-- **PI controller**: Proportional-integral controller used to dynamically balance compute/communication engine core allocation
+- **纯计算函数**：不发起系统调用、不进行 I/O、只消耗声明输入并生成声明输出的用户代码
+- **通信函数**：平台提供的 I/O 原语（如 HTTP），可信，在沙箱外运行
+- **dlibc**：Dandelion 的自定义 C 标准库，由内存中虚拟文件系统支持，不需要系统调用
+- **内存上下文**：为每次函数调用分配的有界连续内存区域
+- **CHERI**：能力硬件增强 RISC 指令集——通过硬件能力实现进程内隔离
+- **rWasm**：Wasm 转安全 Rust 编译器；通过 Rust 内存安全保证在编译时强制隔离
+- **绿色线程（green threads）**：协作用户态线程，不依赖操作系统调度
+- **PI 控制器**：比例积分控制器，用于动态平衡计算/通信引擎的核心分配

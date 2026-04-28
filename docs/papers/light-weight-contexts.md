@@ -1,126 +1,149 @@
-# Light-Weight Contexts: An OS Abstraction for Safety and Performance
+# 轻量级上下文：操作系统的安全与性能抽象
 
-**Authors:** James Litton, Anjo Vahldiek-Oberwagner, Eslam Elnikety, Deepak Garg, Bobby Bhattacharjee, Peter Druschel (University of Maryland / MPI-SWS)  **Venue:** OSDI  **Year:** 2016
+**作者：** James Litton, Anjo Vahldiek-Oberwagner, Eslam Elnikety, Deepak Garg, Bobby Bhattacharjee, Peter Druschel（马里兰大学 / MPI-SWS）  **发表于：** OSDI  **年份：** 2016
 
-## Summary
+---
 
-Light-weight contexts (lwCs) are a new first-class OS abstraction that decouples memory isolation, privilege separation, and execution state from processes and threads. A process can contain multiple lwCs, each with its own virtual memory mappings, file descriptor table, and credentials, while sharing threads. Switching between lwCs costs about half as much as a process/thread context switch. Implemented in FreeBSD 11.0, lwCs enable fast rollback, session isolation, sensitive data compartments, and in-process reference monitors in production servers like Apache and nginx with negligible overhead.
+## 前置知识
 
-## Key Ideas
+- 理解进程和线程的区别（进程有独立地址空间，线程共享进程的地址空间）
+- 了解虚拟内存和地址空间的基本概念
+- 知道什么是权限隔离（不同代码运行在不同信任级别下）
 
-- **Decoupled isolation**: Isolation, privilege, and execution state can be separated from both processes and threads. A lightweight context within a process has its own VM mappings, file descriptors, and credentials, yet shares threads.
-- **Orthogonality to threads**: lwCs are not schedulable entities — they are orthogonal to threads. A thread executes within one lwC at a time and switches via a system call. Multiple threads can execute simultaneously in the same lwC.
-- **Cheap switching**: Switching contexts is essentially just swapping a page table pointer. Using PCID-tagged TLBs avoids full TLB flushes. lwC switch costs 2.01 μs vs. 4.25 μs for process switching.
-- **Four usage patterns**: Snapshot and rollback, event-driven session isolation, sensitive data isolation (e.g., SSL private keys), and in-process reference monitors via `LWC_SYSTRAP`.
-- **COW creation**: `lwCreate` gives the child a copy-on-write copy of the parent's state, analogous to fork. Resource-spec controls what is shared, copied, or unmapped.
+## 你将学到
 
-## Relevance to Shimmy
+- 为什么在同一进程内需要不同的"隔离区域"
+- lwC 如何将隔离从进程中解耦出来
+- 什么是 TLB，以及为什么 PCID 标签能减少切换开销
+- 参考监视器（reference monitor）模式如何用于系统调用拦截
 
-lwCs demonstrate that OS-level isolation need not be expensive, and that a single primitive can unify multiple security use cases. For Shimmy, the most relevant patterns are snapshot/rollback (creating a clean execution environment per student submission) and reference monitor (`LWC_SYSTRAP` for syscall interposition). The main limitation is that lwCs are implemented only in FreeBSD 11.0 — not Linux — making them unavailable in Lambda or standard Linux deployments. Nevertheless, the performance numbers (2 μs switch, negligible nginx overhead) provide a strong existence proof that the isolation overhead needed for Shimmy's use case can be near-zero if the right primitives existed in Linux.
+---
 
-## Detailed Notes
+## 摘要
 
-### Problem & Motivation
+轻量级上下文（lwC）是一种新的一等公民操作系统抽象，将内存隔离、权限分离和执行状态从进程和线程中解耦出来。一个进程可以包含多个 lwC，每个 lwC 拥有自己的虚拟内存映射、文件描述符表和凭证，同时共享线程。lwC 之间的切换成本约为进程/线程上下文切换的一半。在 FreeBSD 11.0 中实现，lwC 为 Apache 和 nginx 等生产服务器提供了快速回滚、会话隔离、敏感数据隔间和进程内参考监视器，开销可忽略不计。
 
-In general-purpose OSes, processes are the unit of isolation, privilege, and execution state. Any computation requiring isolation must run in a separate process, paying the costs of kernel scheduling, resource accounting, context switching, and IPC. But the actual hardware cost of isolation is much smaller: with tagged TLBs, switching an address space requires just a system call and a CR3 register load.
+## 核心思想
 
-Threads separate execution from processes but share a single address space and provide no isolation. Applications needing in-process isolation (web servers isolating user sessions, protecting private keys from Heartbleed-style attacks, running reference monitors) are forced to either use expensive process-based separation or forego isolation entirely.
+> **💡 什么是地址空间（address space）？**
+> 地址空间是程序"看到"的内存全景——从地址 0 到最大地址的所有内存位置。每个进程有自己独立的地址空间，就像每家都有自己的门牌号系统，不同进程的地址 0x1000 指向完全不同的物理内存。切换地址空间（更换进程）需要更新 CPU 内的页表指针，可能还需要刷新 TLB 缓存，这正是进程切换比线程切换慢的原因。
 
-### Design & Architecture
+- **解耦隔离**：隔离、权限和执行状态可以从进程和线程中分离出来。进程内的轻量级上下文拥有自己的虚拟内存映射、文件描述符和凭证，同时共享线程。
+- **与线程正交**：lwC 不是可调度实体——它们与线程正交。一个线程在某一时刻在一个 lwC 中执行，通过系统调用切换。多个线程可以同时在同一 lwC 中执行。
+- **廉价切换**：切换上下文本质上只是交换一个页表指针。使用 PCID 标记的 TLB 避免了完整的 TLB 刷新。lwC 切换耗时 2.01 μs，而进程切换耗时 4.25 μs。
+- **四种使用模式**：快照和回滚、事件驱动会话隔离、敏感数据隔离（如 SSL 私钥）以及通过 `LWC_SYSTRAP` 实现的进程内参考监视器。
+- **写时复制创建**：`lwCreate` 给子 lwC 一个父 lwC 状态的写时复制副本，类似 fork。资源规格控制什么是共享、复制或取消映射。
 
-**The lwC Abstraction**:
+## 与 Shimmy 的关联
 
-Each lwC has:
-- Its own virtual memory space (vmspace)
-- Its own file descriptor table
-- Its own credentials (uid, gid, jail, limits)
+lwC 证明了操作系统级隔离不必昂贵，单个原语可以统一多种安全使用场景。对于 Shimmy，最相关的模式是快照/回滚（为每个学生提交创建干净的执行环境）和参考监视器（用于系统调用插桩的 `LWC_SYSTRAP`）。主要限制是 lwC 仅在 FreeBSD 11.0 中实现——而非 Linux——使其在 Lambda 或标准 Linux 部署中不可用。尽管如此，性能数字（2 μs 切换，可忽略的 nginx 开销）提供了强有力的存在性证明：如果 Linux 中存在正确的原语，Shimmy 用例所需的隔离开销可以接近零。
 
-lwCs are NOT schedulable entities — they are orthogonal to threads.
+## 详细说明
 
-**API**:
+### 问题与动机
 
-| Operation | System Call | Description |
+> **💡 什么是 TLB 和 PCID？**
+> TLB（Translation Lookaside Buffer，快表）是 CPU 中的一块高速缓存，存储虚拟地址到物理地址的映射。当程序切换地址空间时，传统上必须"刷新"整个 TLB，丢弃所有缓存的映射——就像换了一套门牌号系统，所有已记住的映射都失效了。PCID（进程上下文标识符）给 TLB 中的每个条目打上进程标签，切换进程时不需要清空整个 TLB，只需忽略不属于新进程的条目——大大减少了切换开销。
+
+在通用操作系统中，进程是隔离、权限和执行状态的单元。任何需要隔离的计算都必须在独立进程中运行，支付内核调度、资源记账、上下文切换和 IPC 的代价。但隔离的实际硬件成本要小得多：使用标记 TLB，切换地址空间只需要一次系统调用和一次 CR3 寄存器加载。
+
+线程将执行从进程中分离出来，但共享单个地址空间且不提供隔离。需要进程内隔离的应用程序（Web 服务器隔离用户会话、保护私钥免受 Heartbleed 式攻击、运行参考监视器）被迫要么使用昂贵的基于进程的分离，要么完全放弃隔离。
+
+### 设计与架构
+
+**lwC 抽象**：
+
+每个 lwC 拥有：
+- 自己的虚拟内存空间（vmspace）
+- 自己的文件描述符表
+- 自己的凭证（uid、gid、jail、限制）
+
+lwC **不**是可调度实体——它们与线程正交。
+
+**API**：
+
+| 操作 | 系统调用 | 描述 |
 |-----------|------------|-------------|
-| Create | `lwCreate(resource-spec, options)` | Fork-like creation; child gets COW copy of parent |
-| Switch | `lwSwitch(target, args)` | Coroutine-style switch; atomically changes VM, file table, credentials |
-| Restrict | `lwRestrict(l, resource-spec)` | Narrow access capabilities on an lwC descriptor |
-| Overlay | `lwOverlay(l, resource-spec)` | Dynamically map resources from another lwC |
-| Syscall | `lwSyscall(target, mask, syscall, args)` | Execute a syscall on behalf of another lwC |
+| 创建 | `lwCreate(resource-spec, options)` | 类 fork 创建；子 lwC 获得父 lwC 的写时复制副本 |
+| 切换 | `lwSwitch(target, args)` | 协程式切换；原子地更改虚拟内存、文件表、凭证 |
+| 限制 | `lwRestrict(l, resource-spec)` | 缩小 lwC 描述符上的访问能力 |
+| 叠加 | `lwOverlay(l, resource-spec)` | 动态映射另一个 lwC 的资源 |
+| 系统调用 | `lwSyscall(target, mask, syscall, args)` | 代表另一个 lwC 执行系统调用 |
 
-**Sharing Mechanisms**:
-- **Static sharing** at creation time via resource-spec: `LWC_SHARED`, `LWC_COW` (default), or `LWC_UNMAP`
-- **Dynamic sharing** via `lwOverlay`: map memory or file descriptors from another lwC
-- **Access capabilities**: associated with lwC descriptors; can be narrowed with `lwRestrict` but never widened
+**共享机制**：
+- 创建时通过资源规格的**静态共享**：`LWC_SHARED`、`LWC_COW`（默认）或 `LWC_UNMAP`
+- 通过 `lwOverlay` 的**动态共享**：从另一个 lwC 映射内存或文件描述符
+- **访问能力**：与 lwC 描述符关联；可以用 `lwRestrict` 缩小但不能扩大
 
-**System Call Interposition (Reference Monitor)**:
-- With `LWC_SYSTRAP`, a child lwC's prohibited syscalls are redirected to its parent
-- Parent can inspect arguments, perform the call on the child's behalf via `lwSyscall`, or deny it
+**系统调用插桩（参考监视器）**：
+- 使用 `LWC_SYSTRAP`，子 lwC 的被禁系统调用被重定向到其父 lwC
+- 父 lwC 可以检查参数、通过 `lwSyscall` 代表子 lwC 执行调用，或拒绝
 
-**Usage Patterns**:
-1. **Snapshot and Rollback**: Create a lwC snapshot before serving a request; switch back to discard all request-specific state
-2. **Event-driven Session Isolation**: Per-connection lwC in nginx; each connection's event handler runs with a private copy of process state
-3. **Sensitive Data Isolation**: Load private key, create child lwC, erase key in parent, revoke overlay rights. Child exposes only a narrow signing interface.
-4. **Reference Monitor**: Parent creates sandboxed child with `LWC_SYSTRAP`; intercepts all prohibited syscalls before executing on child's behalf
+**使用模式**：
+1. **快照和回滚**：在处理请求前创建 lwC 快照；切换回去以丢弃所有请求特定状态
+2. **事件驱动会话隔离**：nginx 中每个连接一个 lwC；每个连接的事件处理程序使用进程状态的私有副本运行
+3. **敏感数据隔离**：加载私钥，创建子 lwC，在父 lwC 中擦除密钥，撤销叠加权限。子 lwC 仅暴露窄签名接口。
+4. **参考监视器**：父 lwC 创建带 `LWC_SYSTRAP` 的沙箱子 lwC；在代表子 lwC 执行前拦截所有被禁系统调用
 
-### Implementation Details
+### 实现细节
 
-Implemented in **FreeBSD 11.0** kernel.
+在 **FreeBSD 11.0** 内核中实现。
 
-**Memory**: Each lwC has its own vmspace. `lwCreate` replicates the parent's vmspace (COW). Switching swaps the thread's vmspace reference. FreeBSD PCIDs (12-bit process context identifiers) tag TLB entries, so lwC switches avoid full TLB flushes.
+**内存**：每个 lwC 有自己的 vmspace。`lwCreate` 复制父 lwC 的 vmspace（写时复制）。切换交换线程的 vmspace 引用。FreeBSD PCID（12 位进程上下文标识符）标记 TLB 条目，因此 lwC 切换避免了完整的 TLB 刷新。
 
-**File Table**: Copied like fork by default; can be shared entirely as an optimization.
+**文件表**：默认像 fork 一样复制；可以作为优化完全共享。
 
-**Credentials**: Copied like fork. Switching to a previous lwC can restore dropped privileges, enabling the reference monitor pattern.
+**凭证**：像 fork 一样复制。切换到之前的 lwC 可以恢复已丢弃的权限，从而支持参考监视器模式。
 
-### Evaluation
+### 评估
 
-**Hardware**: Dell R410, 2× Intel Xeon X5650 2.66 GHz 6-core, 48 GB RAM, FreeBSD 11.0.
+**硬件**：Dell R410，2× Intel Xeon X5650 2.66 GHz 6 核，48 GB RAM，FreeBSD 11.0。
 
-#### Switch Time Microbenchmarks
+#### 切换时间微基准测试
 
-| Mechanism | Switch time (μs) |
+| 机制 | 切换时间（μs）|
 |-----------|-----------------|
 | lwC | 2.01 |
-| Process | 4.25 |
-| Kernel thread | 4.12 |
-| User thread (no isolation) | 1.71 |
+| 进程 | 4.25 |
+| 内核线程 | 4.12 |
+| 用户线程（无隔离）| 1.71 |
 
-lwC switch costs less than half of a process or kernel thread switch.
+lwC 切换成本不足进程或内核线程切换的一半。
 
-**lwC creation**: 87.7 μs with no page writes (independent of allocated memory). Each COW fault adds ~3 μs.
+**lwC 创建**：无页面写入时 87.7 μs（与分配的内存无关）。每次写时复制故障增加约 3 μs。
 
-**Apache**: lwC matches or exceeds fork at all session lengths; for short sessions (1–16), dramatically faster than fork.
+**Apache**：lwC 在所有会话长度下与 fork 持平或更优；短会话（1–16）比 fork 快得多。
 
-**Nginx**: lwC-event (per-connection lwC) adds no significant overhead across all session lengths. Even with reference monitoring, overhead is minimal.
+**Nginx**：lwC-event（每连接 lwC）在所有会话长度下均无显著开销。即使有参考监视，开销也极小。
 
-**OpenSSL Key Isolation**: 10,000 SSL handshakes took 100.4 s vs. 99.7 s for native — essentially free.
+**OpenSSL 密钥隔离**：10,000 次 SSL 握手耗时 100.4 s，而原生为 99.7 s——基本免费。
 
-**PHP Fast Launch**: lwC snapshots skip PHP runtime initialization. Without opcode cache: 2.7× speedup (226 → 616 req/s).
+**PHP 快速启动**：lwC 快照跳过 PHP 运行时初始化。没有操作码缓存时：2.7× 加速（226 → 616 请求/秒）。
 
-### Strengths & Weaknesses
+### 优势与局限
 
-**Strengths**:
-1. Clean, general abstraction unifying rollback, isolation, privilege separation, and reference monitoring
-2. Near-zero overhead: 2 μs switches, negligible impact on nginx throughput, free SSL key isolation
-3. No language dependence — purely an OS abstraction
-4. Production-scale evaluation on Apache, nginx, OpenSSL, PHP
+**优势**：
+1. 统一回滚、隔离、权限分离和参考监视的干净通用抽象
+2. 接近零开销：2 μs 切换，对 nginx 吞吐量影响可忽略，SSL 密钥隔离几乎免费
+3. 无语言依赖——纯操作系统抽象
+4. 在 Apache、nginx、OpenSSL、PHP 上进行的生产规模评估
 
-**Weaknesses**:
-1. **FreeBSD only**: Prototype in FreeBSD 11.0; porting to Linux requires significant kernel work
-2. **No protection against denial-of-service**: A lwC can block a thread indefinitely or call `exit()` to terminate the entire process
-3. **Manual refactoring required**: No automated tool to identify lwC boundary insertion points
-4. **Shared threads are a double-edged sword**: Threads in different lwCs can interfere with scheduling; requires barrier synchronization during lwCreate
+**局限**：
+1. **仅限 FreeBSD**：FreeBSD 11.0 中的原型；移植到 Linux 需要大量内核工作
+2. **无拒绝服务保护**：lwC 可以无限期阻塞线程或调用 `exit()` 终止整个进程
+3. **需要手动重构**：没有自动化工具识别 lwC 边界插入点
+4. **共享线程是双刃剑**：不同 lwC 中的线程可能干扰调度；需要在 lwCreate 期间进行屏障同步
 
-### Relation to Other Work
+### 与其他工作的关系
 
-lwCs improve on Wedge (sthreads) by avoiding scheduling costs and providing snapshots. They improve on Dune by not requiring VT-x hardware (thus working on virtualized platforms). The Enclosure paper cites lwC as a potential LitterBox backend, which would bring language-integrated policies to lwC's efficient OS-level isolation.
+lwC 通过避免调度成本和提供快照改进了 Wedge（sthreads）。它通过不需要 VT-x 硬件（因此可在虚拟化平台上运行）改进了 Dune。Enclosure 论文将 lwC 引用为潜在的 LitterBox 后端，这将把语言集成策略引入 lwC 的高效操作系统级隔离。
 
-### Glossary
+### 术语表
 
-- **lwC (Light-Weight Context)**: A unit of isolation, privilege, and execution state within a process, with its own VM mappings, file table, and credentials
-- **vmspace**: FreeBSD kernel structure representing a process's (or lwC's) virtual address space
-- **PCID (Process Context Identifier)**: 12-bit TLB tag that avoids full TLB flushes on address space switches
-- **COW (Copy-On-Write)**: Memory sharing strategy where pages are shared until written, then copied
-- **Resource-spec**: The parameter to lwCreate/lwOverlay that specifies how resources are shared, copied, or unmapped
-- **Overlay**: Dynamic mapping of memory/file descriptors from one lwC into another's address space
-- **Reference monitor**: A trusted component that interposes on and controls access to resources
+- **lwC（轻量级上下文）**：进程内的隔离、权限和执行状态单元，拥有自己的虚拟内存映射、文件表和凭证
+- **vmspace**：FreeBSD 内核结构，表示进程（或 lwC）的虚拟地址空间
+- **PCID（进程上下文标识符）**：12 位 TLB 标签，避免地址空间切换时完整的 TLB 刷新
+- **写时复制（COW）**：内存共享策略，页面在写入前共享，写入时复制
+- **资源规格（resource-spec）**：lwCreate/lwOverlay 的参数，指定如何共享、复制或取消映射资源
+- **叠加（overlay）**：将内存/文件描述符从一个 lwC 动态映射到另一个的地址空间
+- **参考监视器（reference monitor）**：拦截并控制资源访问的可信组件

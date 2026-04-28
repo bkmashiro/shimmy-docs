@@ -1,94 +1,129 @@
-# zpoline: A System Call Hook Mechanism Based on Binary Rewriting
+# zpoline: 基于二进制重写的系统调用挂钩机制
 
-**Authors:** Kenichi Yasukata, Hajime Tazaki, Pierre-Louis Aublin, Kenta Ishiguro (IIJ Research Laboratory / Hosei University)  **Venue:** USENIX ATC  **Year:** 2023
+**作者：** Kenichi Yasukata, Hajime Tazaki, Pierre-Louis Aublin, Kenta Ishiguro（IIJ Research Laboratory / 法政大学）  **发表于：** USENIX ATC  **年份：** 2023
 
-## Summary
+---
 
-zpoline is a system call hook mechanism for x86-64 CPUs that replaces `syscall`/`sysenter` instructions with a two-byte `callq *%rax` instruction, jumping to a trampoline at virtual address 0 consisting of a nop sled that redirects execution to a user-defined hook function. It achieves 28–761x lower overhead than exhaustive alternatives (SUD, int3, ptrace) and only 5.2% throughput reduction for Redis on a user-space network stack, compared to 72–99% degradation with other exhaustive mechanisms. The paper received the USENIX ATC 2023 Best Paper award.
+## 前置知识
 
-## Key Ideas
+在阅读本文之前，你应该了解：
 
-- **The core trick**: On x86-64, the calling convention requires `rax` to hold the syscall number before executing `syscall`/`sysenter`. Since syscall numbers are small integers (0–~500), `callq *%rax` (also exactly 2 bytes: `0xff 0xd0`) jumps to a virtual address between 0 and ~500. Placing a nop sled + jump-to-hook at virtual address 0 routes every rewritten syscall instruction through the hook automatically.
-- **Binary rewriting**: Replaces every `syscall` (0x0f 0x05) and `sysenter` (0x0f 0x34) instruction with `callq *%rax` (0xff 0xd0). Both source and target are exactly 2 bytes, so the replacement never breaks neighboring instructions.
-- **Trampoline structure**: Virtual address 0 contains single-byte `nop` instructions for addresses 0–N (max syscall number), followed by a jump to the user-defined hook function.
-- **NULL access termination**: Uses MPK (execute-only memory) to preserve NULL read/write faults, plus a bitmap of rewritten addresses to detect unexpected control transfers to address 0.
-- **Hook isolation**: Uses `dlmopen` to load the hook implementation in a separate namespace to avoid infinite loops when hook functions call into libc.
-- **No kernel modifications**: Pure user-space solution, loadable via LD_PRELOAD.
-- **Performance**: 41 ns overhead per hook (vs. 31,201 ns for ptrace, 1,156 ns for SUD).
+- 程序是如何运行的（进程、内存地址）
+- 什么是函数调用和返回地址
+- 基本的 x86-64 寄存器（RAX、RDI 等）
+- 什么是系统调用（syscall）——程序请求内核服务的方式
 
-## Relevance to Shimmy
+## 你将学到
 
-zpoline is directly referenced as a state-of-the-art syscall interception technique in Shimmy's research. It demonstrates that user-space syscall interception can achieve near-LD_PRELOAD performance while being exhaustive for statically-loaded code. However, the requirement for `mmap_min_addr = 0` makes it non-viable inside AWS Lambda. For self-hosted Shimmy deployments, zpoline (or its successor lazypoline) would be the recommended mechanism for DBI-based sandboxing. The paper also motivates why simpler approaches like LD_PRELOAD alone are insufficient for security-critical sandboxing.
+- zpoline 如何用一个聪明的技巧拦截所有系统调用
+- 什么是"蹦床代码"（trampoline）
+- 为什么 ptrace 等传统方式开销太大
+- 系统调用拦截在沙箱技术中的核心地位
 
-## Detailed Notes
+---
 
-### Problem & Motivation
+## 摘要
 
-System call hooks are essential for tracing, sandboxing, OS emulation, and transparently applying user-space OS subsystems (like user-space TCP/IP stacks backed by DPDK). However, no existing mechanism for UNIX-like systems on x86-64 simultaneously achieves:
+> **💡 什么是系统调用（syscall）？**
+> 程序运行在"用户态"，不能直接操作硬件。每次需要读文件、发网络请求、申请内存，都要通过系统调用向内核"请求"帮忙——就像在餐厅点餐，你（程序）只能点菜，厨房（内核）才能动锅。
 
-1. Low hook overhead
-2. Exhaustive hooking (catches all syscalls)
-3. No overwriting of unrelated instructions
-4. No kernel modifications
-5. No source code requirement
-6. No specially modified standard libraries
-7. Usable for syscall emulation
+zpoline 是一种针对 x86-64 CPU 的系统调用挂钩机制。它将程序中所有的 `syscall`/`sysenter` 指令替换为两字节的 `callq *%rax` 指令，使执行流跳转到虚拟地址 0 处的一个"蹦床"结构——该蹦床由一段 nop 滑道组成，将执行重定向到用户自定义的挂钩函数。与其他穷举式方案（SUD、int3、ptrace）相比，zpoline 的开销降低了 28–761 倍；在用户态网络栈上运行 Redis 时，吞吐量仅降低 5.2%，而其他穷举式机制的降幅高达 72–99%。本文荣获 USENIX ATC 2023 最佳论文奖。
 
-**ptrace** is exhaustive but imposes 31,201 ns per hook (context switch between tracer/tracee). **int3 signaling** and **SUD** achieve exhaustive hooking at 1,342 ns and 1,156 ns respectively (signal handling overhead). **LD_PRELOAD** has ~6 ns overhead but cannot exhaustively hook syscalls — glibc embeds `syscall`/`sysenter` in internal functions invisible to LD_PRELOAD. Other binary rewriting techniques (instruction punning, E9Patch, XContainers) cannot exhaustively rewrite all syscall sites due to disassembly limitations.
+## 核心思想
 
-### Design & Architecture
+> **💡 什么是寄存器（register）？**
+> 寄存器是 CPU 内部的超小型存储单元，访问速度比内存快约 100 倍。x86-64 CPU 有 16 个通用寄存器，其中 RAX 在发起系统调用时存放"系统调用号"——告诉内核你要做什么操作（比如 1 = write，60 = exit）。
 
-**Binary Rewriting**: zpoline replaces every `syscall` and `sysenter` instruction found in executable memory regions with `callq *%rax`. Since both source and target instructions are exactly 2 bytes, the replacement never breaks neighboring instructions — a fundamental advantage over techniques that need more bytes for jump targets.
+- **核心技巧**：在 x86-64 上，调用约定要求 `rax` 在执行 `syscall`/`sysenter` 前保存系统调用号。由于系统调用号是小整数（0–~500），`callq *%rax`（同样恰好是两字节：`0xff 0xd0`）会跳转到虚拟地址 0 到 ~500 之间的某处。在虚拟地址 0 处放置一段 nop 滑道加跳转到挂钩函数的代码，即可自动将每条被改写的 syscall 指令路由到挂钩函数。
+- **二进制重写**：将可执行内存中所有 `syscall`（0x0f 0x05）和 `sysenter`（0x0f 0x34）指令替换为 `callq *%rax`（0xff 0xd0）。由于源指令和目标指令均恰好是两字节，替换不会破坏相邻指令。
+- **蹦床结构**：在虚拟地址 0 处，放置单字节 `nop` 指令覆盖地址 0–N（最大系统调用号），之后跟一个跳转到用户自定义挂钩函数的指令。
+- **NULL 访问终止**：使用 MPK（仅执行内存）保留 NULL 读写故障，并用一个存有被改写地址的位图检测意外的控制流转移到地址 0。
+- **挂钩隔离**：使用 `dlmopen` 将挂钩实现加载到独立命名空间，避免挂钩函数调用 libc 时产生无限循环。
+- **无需内核修改**：纯用户态方案，可通过 LD_PRELOAD 加载。
+- **性能**：每次挂钩开销 41 ns（对比 ptrace 的 31,201 ns、SUD 的 1,156 ns）。
 
-**Trampoline Code**: At virtual address 0, zpoline allocates memory and fills it with:
-- Addresses 0 through N (max syscall number, ~448 on Linux 5.15): single-byte `nop` (0x90) instructions
-- Address N+1: a jump to the user-defined hook function
+## 与 Shimmy 的关联
 
-When `callq *%rax` executes with, say, `rax = 1` (write), execution jumps to address 1, slides through all subsequent nops, and arrives at the hook function.
+zpoline 在 Shimmy 的研究中被直接引用为最先进的系统调用拦截技术。它证明了用户态系统调用拦截可以在穷举拦截所有已静态加载代码的同时，达到接近 LD_PRELOAD 的性能水平。然而，由于需要将 `mmap_min_addr` 设为 0，在 AWS Lambda 内部无法使用。在自托管 Shimmy 部署中，zpoline（或其继任者 lazypoline）将是 DBI 沙箱的推荐机制。本文也说明了为何仅依赖 LD_PRELOAD 等简单方案不足以满足安全关键沙箱的需求。
 
-**NULL Access Termination**: Mapping memory at virtual address 0 breaks NULL pointer detection. zpoline mitigates this via eXecute-Only Memory (XOM) using MPK for NULL reads/writes, and a bitmap of replaced syscall addresses to detect unexpected NULL code execution.
+## 详细说明
 
-**Setup Procedure**: Implemented as a shared library (`libzpoline.so`) loaded via LD_PRELOAD, or a special loader for statically linked binaries. Before `main()` starts, it mmaps virtual address 0, fills the trampoline, scans executable memory from procfs, and replaces syscall instructions.
+### 问题与动机
 
-### Evaluation
+> **💡 什么是 ptrace？**
+> ptrace 是 Linux 内核提供的一种调试接口，允许一个进程（"追踪者"）监控另一个进程（"被追踪者"）的所有系统调用。每次被追踪进程发起系统调用时，内核都会暂停它，通知追踪者，再继续——就像给每个系统调用装了一个"收费站"，每次都要停车验票，自然很慢。
 
-| Mechanism | Time (ns) | Relative to zpoline |
+系统调用挂钩对于追踪、沙箱、操作系统仿真，以及透明应用用户态 OS 子系统（如基于 DPDK 的用户态 TCP/IP 栈）至关重要。然而，现有的 UNIX 类系统 x86-64 机制没有一种能同时满足：
+
+1. 低挂钩开销
+2. 穷举挂钩（捕获所有系统调用）
+3. 不覆盖无关指令
+4. 无需内核修改
+5. 无需源代码
+6. 无需特别修改的标准库
+7. 可用于系统调用仿真
+
+**ptrace** 虽然穷举，但每次挂钩需要 31,201 ns（追踪者/被追踪者之间的上下文切换）。**int3 信号**和 **SUD** 分别以 1,342 ns 和 1,156 ns 实现穷举挂钩（信号处理开销）。**LD_PRELOAD** 开销约 6 ns，但无法穷举拦截系统调用——glibc 在 LD_PRELOAD 不可见的内部函数中内嵌了 `syscall`/`sysenter`。其他二进制重写技术（指令双关、E9Patch、XContainers）因反汇编局限性无法穷举改写所有系统调用位置。
+
+### 设计与架构
+
+> **💡 什么是二进制重写（binary rewriting）？**
+> 程序编译后变成机器码（二进制文件）。二进制重写是在不拥有源代码的情况下，直接修改这些机器码字节。就像给一本已经印好的书直接涂改文字，而不是重新编辑原稿。zpoline 把书中所有"去内核"的指令（syscall）换成"先绕道蹦床"的指令（callq *rax）。
+
+**二进制重写**：zpoline 将可执行内存区域中找到的所有 `syscall` 和 `sysenter` 指令替换为 `callq *%rax`。由于源指令和目标指令均恰好是两字节，替换不会破坏相邻指令——这是相对于需要更多字节跳转目标的技术的根本优势。
+
+**蹦床代码**：在虚拟地址 0 处，zpoline 分配内存并填入：
+- 地址 0 到 N（最大系统调用号，Linux 5.15 上约为 448）：单字节 `nop`（0x90）指令
+- 地址 N+1：跳转到用户自定义挂钩函数
+
+当 `callq *%rax` 以 `rax = 1`（write）执行时，执行流跳转到地址 1，滑过所有后续 nop，到达挂钩函数。
+
+**NULL 访问终止**：在虚拟地址 0 处映射内存会破坏 NULL 指针检测。zpoline 通过使用 MPK 实现仅执行内存（XOM）来缓解对 NULL 的读写，并用一个存有被替换 syscall 地址的位图检测意外的 NULL 代码执行。
+
+> **💡 什么是 MPK（内存保护键）？**
+> MPK（Memory Protection Keys）是 Intel CPU 的一项硬件特性，允许程序在不修改页表的情况下快速切换内存页的访问权限。zpoline 用它把地址 0 附近的内存设为"只能执行、不能读写"，这样即使程序误跳到那里，也不会被当成普通数据读取而泄露信息。
+
+**设置流程**：作为共享库（`libzpoline.so`）通过 LD_PRELOAD 加载，或作为静态链接二进制的特殊加载器。在 `main()` 启动前，它通过 mmap 映射虚拟地址 0，填充蹦床，扫描 procfs 中的可执行内存，并替换 syscall 指令。
+
+### 评估
+
+| 机制 | 时间（ns） | 相对于 zpoline |
 |-----------|-----------|---------------------|
-| ptrace | 31,201 | 761x slower |
-| int3 signaling | 1,342 | 32.7x slower |
-| SUD | 1,156 | 28.1x slower |
+| ptrace | 31,201 | 慢 761 倍 |
+| int3 信号 | 1,342 | 慢 32.7 倍 |
+| SUD | 1,156 | 慢 28.1 倍 |
 | zpoline | 41 | — |
-| LD_PRELOAD | 6 | 6.8x faster |
+| LD_PRELOAD | 6 | 快 6.8 倍 |
 
-**Application Benchmarks (lwIP + DPDK)**:
-- Redis (GET workload): zpoline 5.2% throughput reduction vs. LD_PRELOAD; SUD 72.3%, int3 75.0%, ptrace 98.8%
-- HTTP server: zpoline 12.7% reduction; SUD 83.0%, int3 85.3%, ptrace 98.9%
+**应用基准测试（lwIP + DPDK）**：
+- Redis（GET 负载）：zpoline 吞吐量下降 5.2%（对比 LD_PRELOAD）；SUD 72.3%、int3 75.0%、ptrace 98.8%
+- HTTP 服务器：zpoline 下降 12.7%；SUD 83.0%、int3 85.3%、ptrace 98.9%
 
-### Strengths & Weaknesses
+### 优势与局限
 
-**Strengths**:
-1. Elegant 2-byte rewriting trick that completely solves the instruction-size mismatch problem
-2. Practical performance: 41 ns overhead, 28–761x better than exhaustive alternatives
-3. No kernel modifications; transparent to applications
+**优势**：
+1. 优雅的两字节重写技巧，彻底解决了指令大小不匹配问题
+2. 实用性能：41 ns 开销，比穷举替代方案好 28–761 倍
+3. 无需内核修改；对应用程序透明
 
-**Weaknesses**:
-1. **Not truly exhaustive**: Cannot hook syscalls loaded or generated after setup (JIT compilers, packed binaries)
-2. **x86-64 only**: Relies on variable-length instructions and unaligned jumps
-3. **Virtual address 0 requirement**: Needs root or `mmap_min_addr = 0` — unavailable in AWS Lambda
-4. **No security guarantees**: Trampoline and hook are in the same address space as the application; a malicious process can bypass
+**局限**：
+1. **并非真正穷举**：无法挂钩设置后加载或生成的系统调用（JIT 编译器、打包二进制）
+2. **仅限 x86-64**：依赖变长指令和非对齐跳转
+3. **需要虚拟地址 0**：需要 root 权限或 `mmap_min_addr = 0`——在 AWS Lambda 中不可用
+4. **无安全保证**：蹦床和挂钩与应用程序处于同一地址空间；恶意进程可以绕过
 
-### Relation to Other Work
+### 与其他工作的关系
 
-zpoline's most direct descendant is lazypoline (DSN 2024), which uses zpoline as its fast path but adds SUD as a slow path for exhaustive discovery of dynamically generated syscall sites, directly addressing zpoline's biggest limitation.
+zpoline 最直接的继任者是 lazypoline（DSN 2024），它以 zpoline 作为快速路径，以 SUD 作为慢速路径用于穷举发现动态生成的系统调用位置，直接解决了 zpoline 的最大局限。
 
-### Glossary
+### 术语表
 
-- **zpoline**: System call hook mechanism that rewrites syscall/sysenter to `callq *%rax` with a trampoline at virtual address 0
-- **Trampoline code**: The nop sled at address 0..N followed by a jump to the hook function
-- **`callq *%rax`**: x86-64 instruction (0xff 0xd0) that pushes the return address and jumps to the address in rax
-- **Nop sled**: A sequence of nop (0x90) instructions that execution "slides" through to reach the hook
-- **XOM (eXecute-Only Memory)**: Memory protection mode where pages can be executed but not read or written
-- **SUD (Syscall User Dispatch)**: Linux kernel mechanism (since 5.11) that raises SIGSYS on syscall invocation for user-space handling
-- **vDSO**: Virtual dynamic shared object; kernel-provided library for fast syscalls that bypass the normal syscall path
-- **DPDK (Data Plane Development Kit)**: Framework for kernel-bypass packet processing
-- **lwIP**: Lightweight TCP/IP stack that can run in user space
+- **zpoline**：将 syscall/sysenter 重写为 `callq *%rax`、在虚拟地址 0 设置蹦床的系统调用挂钩机制
+- **蹦床代码（trampoline code）**：地址 0..N 处的 nop 滑道，后接跳转到挂钩函数的指令
+- **`callq *%rax`**：x86-64 指令（0xff 0xd0），压入返回地址并跳转到 rax 中的地址
+- **nop 滑道（nop sled）**：一串 nop（0x90）指令，执行流"滑过"它们到达挂钩函数
+- **XOM（仅执行内存）**：页面可执行但不可读写的内存保护模式
+- **SUD（Syscall User Dispatch）**：Linux 内核机制（5.11 起），在系统调用时向用户态发送 SIGSYS
+- **vDSO**：虚拟动态共享对象；内核提供的库，实现绕过正常系统调用路径的快速系统调用
+- **DPDK（Data Plane Development Kit）**：内核旁路数据包处理框架
+- **lwIP**：可在用户态运行的轻量级 TCP/IP 协议栈

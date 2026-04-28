@@ -1,112 +1,135 @@
-# Faasm: Lightweight Isolation for Efficient Stateful Serverless Computing
+# Faasm：面向高效有状态无服务器计算的轻量级隔离
 
-**Authors:** Simon Shillaker, Peter Pietzuch (Imperial College London)  **Venue:** USENIX ATC  **Year:** 2020
+**作者：** Simon Shillaker, Peter Pietzuch（Imperial College London）  **发表于：** USENIX ATC  **年份：** 2020
 
-## Summary
+---
 
-Faasm introduces Faaslets, a new isolation abstraction for serverless computing that combines WebAssembly-based software fault isolation (SFI) for memory safety, Linux cgroups for CPU/network resource isolation, and shared memory regions for efficient state sharing between co-located functions. Faasm achieves 2× speed-up and 10× memory reduction over containers for ML training, doubles inference throughput, and reduces cold starts to hundreds of microseconds via Proto-Faaslet snapshots.
+## 前置知识
 
-## Key Ideas
+- 了解无服务器计算的基本概念（Lambda、函数即服务）
+- 理解什么是进程隔离（不同程序之间互不干扰）
+- 知道 WebAssembly（WASM）的基本概念——一种可在沙箱中运行的字节码格式
 
-- **Faaslet abstraction**: Wraps a WebAssembly function with memory safety (SFI), CPU isolation (cgroups/CFS), network isolation (namespaces + tc), private memory, and shared memory regions — a complete isolation mechanism far lighter than containers.
-- **Shared memory regions**: WebAssembly's linear memory model can be extended with regions that map onto common process memory without breaking safety guarantees. Co-located functions share in-memory state directly (zero-copy, zero-serialization).
-- **Two-tier state architecture**: Local tier (shared memory within a host) + global tier (distributed KVS, currently Redis). Functions synchronize via explicit `push`/`pull` operations; large values split into independently managed chunks.
-- **Proto-Faaslets**: Pre-initialized Faaslet snapshots (stack, heap, function table, stack pointer). Since WebAssembly memory is a simple byte array, snapshots are OS-independent and restorable via COW mapping in ~0.5 ms vs. ~5 ms for a fresh Faaslet or ~2.8 s for Docker.
-- **Minimal host interface**: Not a full POSIX environment — a serverless-specific API for function invocation, key-value state, dynamic linking, memory, networking, and file I/O.
+## 你将学到
 
-## Relevance to Shimmy
+- 为什么容器对无服务器计算来说"太重"
+- Faaslet 如何将 WASM 内存安全与 Linux cgroup 资源隔离结合
+- 什么是"Proto-Faaslet"及其如何消除冷启动开销
+- 共享内存区域如何解决无服务器函数的数据传输瓶颈
 
-Faasm demonstrates that WebAssembly can serve as a production isolation mechanism for serverless computing, providing memory safety without containers or kernel-level sandboxing primitives. For Shimmy, which runs inside AWS Lambda where seccomp/namespaces are blocked, Faasm validates the wazero/WASM approach: Path B (wazero WASM sandbox) is architecturally identical to a single Faaslet, and the Proto-Faaslet snapshot mechanism directly motivates caching pre-compiled WASM modules to eliminate cold-start overhead. The paper also shows that WebAssembly's 32-bit address space limitation and compute overhead (40–240% for some benchmarks) are the practical constraints for this approach.
+---
 
-## Detailed Notes
+## 摘要
 
-### Problem & Motivation
+Faasm 引入了 Faaslet——一种新的无服务器计算隔离抽象，将基于 WebAssembly 的软件故障隔离（SFI）用于内存安全，Linux cgroups 用于 CPU/网络资源隔离，共享内存区域用于同机函数之间的高效状态共享。Faasm 在机器学习训练上实现了 2× 加速和 10× 内存减少，将推理吞吐量翻倍，并通过 Proto-Faaslet 快照将冷启动时间减少到数百微秒。
 
-Serverless computing has two fundamental problems:
+## 核心思想
 
-1. **Data access overhead**: Stateless containers force all state to live externally (S3, Redis). Functions must duplicate, serialize, and transfer data repeatedly — worse with parallelism.
-2. **Container resource footprint**: Multi-megabyte memory, hundreds-of-milliseconds cold starts, limited to thousands per machine.
+> **💡 什么是 SFI（软件故障隔离）？**
+> SFI（Software Fault Isolation）是一种通过编译时插桩和运行时边界检查来限制代码内存访问范围的技术。WebAssembly 内置了 SFI：每次内存访问都会检查是否在允许的"线性内存"范围内，越界访问会触发"陷阱"（trap）并终止执行，而不是悄悄读写其他程序的内存。
 
-The "cold start problem" and "data-shipping architecture" together prevent serverless from reaching its theoretical potential for data-intensive parallel workloads like ML training.
+- **Faaslet 抽象**：将一个 WebAssembly 函数包裹以内存安全（SFI）、CPU 隔离（cgroups/CFS）、网络隔离（命名空间 + tc）、私有内存和共享内存区域——一种远比容器轻量的完整隔离机制。
+- **共享内存区域**：WebAssembly 的线性内存模型可以扩展为通过 `mremap` 映射到公共进程内存的区域，而不破坏安全保证。同机函数直接共享内存状态（零复制、零序列化）。
+- **两级状态架构**：本地层（同一宿主机上的共享内存）+ 全局层（分布式键值存储，当前为 Redis）。函数通过显式的 `push`/`pull` 操作同步；大值被拆分为独立管理的块。
+- **Proto-Faaslet**：预初始化的 Faaslet 快照（栈、堆、函数表、栈指针）。由于 WebAssembly 内存是一个简单的字节数组，快照是操作系统无关的，可通过写时复制映射在约 0.5 ms 内恢复（对比从头创建 Faaslet 的约 5 ms 或 Docker 的约 2.8 s）。
+- **最小宿主接口**：不是完整的 POSIX 环境——而是专为无服务器设计的 API，用于函数调用、键值状态、动态链接、内存、网络和文件 I/O。
 
-### Design & Architecture
+## 与 Shimmy 的关联
 
-**Faaslet abstraction components**:
-- **Memory safety**: WebAssembly SFI — bounds-checked linear byte array; violations trigger traps
-- **CPU isolation**: Dedicated thread in a cgroup with equal CPU share, scheduled by Linux CFS
-- **Network isolation**: Own network namespace with virtual interface; `tc` enforces ingress/egress rate limits
-- **Private memory**: Contiguous region allocated from process memory, accessed via offsets from zero
-- **Shared memory regions**: Extensions of the linear byte array remapped via `mremap` onto common process memory
+Faasm 证明了 WebAssembly 可以作为无服务器计算的生产级隔离机制，在不使用容器或内核级沙箱原语的情况下提供内存安全。对于在 AWS Lambda 内运行（seccomp/命名空间被阻塞）的 Shimmy，Faasm 验证了 wazero/WASM 方案：路径 B（wazero WASM 沙箱）在架构上与单个 Faaslet 完全相同，Proto-Faaslet 快照机制直接激励了缓存预编译 WASM 模块以消除冷启动开销。本文还展示了 WebAssembly 的 32 位地址空间限制和计算开销（某些基准测试 40–240%）是这一方案的实际约束。
 
-**Host interface** (not POSIX — serverless-specific):
-- Function invocation: `chain_call`, `await_call`, `get_call_output`
-- State API: `get_state`, `set_state`, `push/pull_state`, locking
-- Dynamic linking: `dlopen`/`dlsym` for pre-compiled WebAssembly modules
-- File I/O: Read-global, write-local filesystem with WASI capability-based security
+## 详细说明
 
-**Proto-Faaslet mechanism**:
-- Pre-initialize Faaslets and snapshot memory (stack, heap, function table)
-- WebAssembly memory = simple byte array → snapshots are OS-independent
-- Restore via copy-on-write memory mapping
-- Guarantees clean state between calls (no information leakage between tenants)
+### 问题与动机
 
-**Two-tier state**:
-- **Local tier**: State replicas as shared memory regions; local read/write locks for consistency
-- **Global tier**: Authoritative values in distributed KVS; explicit `push`/`pull` for synchronization
-- **DDOs (Distributed Data Objects)**: Language-specific classes (`SparseMatrixReadOnly`, `VectorAsync`) hiding the two-tier architecture
+> **💡 什么是冷启动（cold start）？**
+> 冷启动是指从零开始初始化一个新的函数执行环境所需的时间。就像冬天早上发动一辆长期停放的汽车：需要等待引擎预热（加载运行时、初始化内存、建立网络连接）才能正常行驶。对于无服务器函数，冷启动延迟可能达到秒级，严重影响用户体验。
 
-### Evaluation
+无服务器计算有两个根本问题：
 
-**Testbed**: 20 Intel Xeon E3-1220 3.1 GHz machines, 16 GB RAM, 1 Gbps network. Baseline: Knative with Docker containers.
+1. **数据访问开销**：无状态容器迫使所有状态存储在外部（S3、Redis）。函数必须反复复制、序列化和传输数据——并行性越高情况越糟。
+2. **容器资源占用**：数十兆字节内存、数百毫秒冷启动、每台机器仅能运行数千个。
 
-#### Faaslet vs. Container Overhead
+"冷启动问题"和"数据传输架构"共同阻止了无服务器计算在机器学习训练等数据密集型并行工作负载中发挥理论潜力。
 
-| Metric | Docker | Faaslet | Proto-Faaslet | Improvement |
+### 设计与架构
+
+**Faaslet 抽象组件**：
+- **内存安全**：WebAssembly SFI——有边界检查的线性字节数组；违规触发陷阱
+- **CPU 隔离**：在 cgroup 中的专用线程，具有平等 CPU 份额，由 Linux CFS 调度
+- **网络隔离**：带虚拟接口的独立网络命名空间；`tc` 强制入站/出站速率限制
+- **私有内存**：从进程内存分配的连续区域，通过零偏移量访问
+- **共享内存区域**：通过 `mremap` 重新映射到公共进程内存的线性字节数组扩展
+
+**宿主接口**（非 POSIX——无服务器专用）：
+- 函数调用：`chain_call`、`await_call`、`get_call_output`
+- 状态 API：`get_state`、`set_state`、`push/pull_state`、锁定
+- 动态链接：用于预编译 WebAssembly 模块的 `dlopen`/`dlsym`
+- 文件 I/O：带 WASI 基于能力的安全性的读全局、写本地文件系统
+
+**Proto-Faaslet 机制**：
+- 预初始化 Faaslet 并快照内存（栈、堆、函数表）
+- WebAssembly 内存 = 简单字节数组 → 快照是操作系统无关的
+- 通过写时复制内存映射恢复
+- 保证调用之间的干净状态（租户之间无信息泄漏）
+
+**两级状态**：
+- **本地层**：共享内存区域中的状态副本；本地读写锁保证一致性
+- **全局层**：分布式键值存储中的权威值；显式 `push`/`pull` 用于同步
+- **DDO（分布式数据对象）**：语言特定类（`SparseMatrixReadOnly`、`VectorAsync`）隐藏两级架构
+
+### 评估
+
+**测试环境**：20 台 Intel Xeon E3-1220 3.1 GHz 机器，16 GB RAM，1 Gbps 网络。基准：Knative + Docker 容器。
+
+#### Faaslet vs. 容器开销
+
+| 指标 | Docker | Faaslet | Proto-Faaslet | 改善 |
 |--------|--------|---------|---------------|-------------|
-| Init time | 2.8 s | 5.2 ms | 0.5 ms | 5600× |
-| CPU cycles | 251M | 1.4K | 650 | 385K× |
-| PSS memory | 1.3 MB | 200 KB | 90 KB | 15× |
-| Capacity | ~8K | ~70K | >100K | 12× |
+| 初始化时间 | 2.8 s | 5.2 ms | 0.5 ms | 5600× |
+| CPU 周期 | 2.51 亿 | 1.4K | 650 | 38.5 万× |
+| PSS 内存 | 1.3 MB | 200 KB | 90 KB | 15× |
+| 容量 | 约 8K | 约 70K | >100K | 12× |
 
-**ML Training (SGD, Reuters RCV1)**:
-- 60% faster at 15 parallel functions
-- Faasm scales to 38 functions (80% improvement); Knative exhausts memory at 30
-- 70% reduction in network traffic due to local-tier batching
-- 10× reduction in billable memory
+**机器学习训练（SGD，Reuters RCV1）**：
+- 15 个并行函数时快 60%
+- Faasm 扩展到 38 个函数（提升 80%）；Knative 在 30 个时耗尽内存
+- 由于本地层批处理，网络流量减少 70%
+- 可计费内存减少 10×
 
-**ML Inference (TensorFlow Lite / MobileNet)**:
-- 200%+ increase in throughput
-- Cold starts nearly free: <1 ms (Proto-Faaslet restore)
+**机器学习推理（TensorFlow Lite / MobileNet）**：
+- 吞吐量提升 200%+
+- 冷启动几乎免费：<1 ms（Proto-Faaslet 恢复）
 
-**Compute overhead (Polybench/C benchmarks)**: Most comparable to native; two benchmarks with 40–55% overhead due to lost loop optimizations; Python pidigits benchmark 240% overhead (big integer arithmetic in 32-bit WASM).
+**计算开销（Polybench/C 基准测试）**：大多数与原生相当；两个基准测试因循环优化丢失有 40–55% 开销；Python pidigits 基准测试 240% 开销（32 位 WASM 中的大整数运算）。
 
-### Strengths & Weaknesses
+### 优势与局限
 
-**Strengths**:
-1. Demonstrates containers are not the only viable isolation mechanism for serverless
-2. Elegant layering: WebAssembly handles memory safety (the hard part), cgroups handle resources (the easy part)
-3. 15× less memory, 5600× faster cold starts, 12× higher density than Docker
-4. Two-tier architecture solves the data-shipping problem without sacrificing isolation
+**优势**：
+1. 证明容器并非无服务器计算唯一可行的隔离机制
+2. 优雅的分层：WebAssembly 处理内存安全（困难部分），cgroups 处理资源（容易部分）
+3. 内存减少 15×，冷启动加快 5600×，比 Docker 密度高 12×
+4. 两级架构解决了数据传输问题而不牺牲隔离
 
-**Weaknesses**:
-1. **32-bit address space**: Restricts Faaslets to 4 GB per function (64-bit WASM in development)
-2. **WebAssembly performance overhead**: Some workloads 40–240% overhead due to lost compiler optimizations
-3. **Trusted host interface**: Host interface bugs could break isolation; it operates outside WebAssembly's safety guarantees
-4. **Redis as global tier**: Potential bottleneck for large-scale state synchronization
+**局限**：
+1. **32 位地址空间**：将 Faaslet 限制在每个函数 4 GB（64 位 WASM 正在开发）
+2. **WebAssembly 性能开销**：某些工作负载因编译器优化丢失有 40–240% 开销
+3. **可信宿主接口**：宿主接口 bug 可能破坏隔离；它在 WebAssembly 安全保证之外运行
+4. **Redis 作为全局层**：大规模状态同步的潜在瓶颈
 
-### Implementation Details
+### 实现细节
 
-- **Compilation pipeline**: User compiles to WebAssembly → Faasm validates binary → generates machine code via LLVM JIT → links with host interface
-- **Languages**: C/C++, Python, TypeScript (compilation to WebAssembly); CPython ported with <10 lines changed
-- **WebAssembly VM**: WAVM (passes conformance tests)
-- **Platform integration**: Deployed on Knative (Kubernetes-based serverless)
+- **编译流水线**：用户编译到 WebAssembly → Faasm 验证二进制文件 → 通过 LLVM JIT 生成机器码 → 与宿主接口链接
+- **支持语言**：C/C++、Python、TypeScript（编译到 WebAssembly）；CPython 移植修改不到 10 行
+- **WebAssembly VM**：WAVM（通过一致性测试）
+- **平台集成**：部署在 Knative（基于 Kubernetes 的无服务器平台）上
 
-### Glossary
+### 术语表
 
-- **Faaslet**: Faasm's isolation abstraction combining WebAssembly SFI, Linux cgroups, and shared memory regions
-- **Proto-Faaslet**: A snapshot of a pre-initialized Faaslet, restorable in hundreds of microseconds on any host
-- **SFI (Software Fault Isolation)**: Restricts memory access through compile-time instrumentation and runtime traps
-- **Two-tier state**: Local tier (shared memory on one host) + global tier (distributed KVS)
-- **DDO (Distributed Data Object)**: Language-specific class exposing a high-level state interface over key-value state API
-- **WASI**: WebAssembly System Interface — an emerging standard for server-side WebAssembly host interactions
-- **Cold start**: The latency of initializing a new function instance from scratch
+- **Faaslet**：Faasm 的隔离抽象，结合 WebAssembly SFI、Linux cgroups 和共享内存区域
+- **Proto-Faaslet**：预初始化 Faaslet 的快照，可在任意宿主机上数百微秒内恢复
+- **SFI（软件故障隔离）**：通过编译时插桩和运行时陷阱限制内存访问
+- **两级状态**：本地层（同一宿主机上的共享内存）+ 全局层（分布式键值存储）
+- **DDO（分布式数据对象）**：通过键值状态 API 提供高级状态接口的语言特定类
+- **WASI**：WebAssembly System Interface——服务端 WebAssembly 宿主交互的新兴标准
+- **冷启动（cold start）**：从头初始化新函数实例的延迟

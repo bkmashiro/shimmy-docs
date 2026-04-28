@@ -1,101 +1,124 @@
-# Enclosure: Language-Based Restriction of Untrusted Libraries
+# Enclosure：对不可信库的语言级限制
 
-**Authors:** Adrien Ghosn, Marios Kogias, Mathias Payer, James R. Larus, Edouard Bugnion (EPFL / Microsoft Research)  **Venue:** ASPLOS  **Year:** 2021
+**作者：** Adrien Ghosn, Marios Kogias, Mathias Payer, James R. Larus, Edouard Bugnion（EPFL / Microsoft Research）  **发表于：** ASPLOS  **年份：** 2021
 
-## Summary
+---
 
-Enclosure is a programming language construct that restricts untrusted library code from accessing program resources it should not touch. A single `with [policies] func() { body }` annotation binds a closure to a memory view (which packages are visible) and a syscall filter (which syscalls are allowed), enforced at runtime by LitterBox using Intel MPK or VT-x hardware. Implemented for Go and Python, enclosures can isolate 160K+ lines of untrusted dependency code with a single annotation, incurring as little as 1.02× overhead on real HTTP workloads.
+## 前置知识
 
-## Key Ideas
+- 理解什么是库（library）和依赖（dependency）
+- 了解内存隔离的基本概念
+- 知道什么是系统调用（程序请求内核服务的方式）
 
-- **Package-granularity isolation**: Packages are the right unit of isolation — they have well-defined entry points, explicitly declared dependencies, and their own code/data/heap. The system automatically computes a *minimal memory view* from the import graph, without requiring the developer to enumerate memory regions.
-- **The `with` construct**: `with [policies] func() { body }` is a dynamically scoped expression. Policies apply to the closure body and all code it transitively invokes, including through deep dependency chains. Violations cause faults.
-- **LitterBox backend**: A language-independent runtime framework enforcing policies via hardware. Two backends: LB_MPK (Intel MPK, 86 ns switch) and LB_VTX (Intel VT-x, 924 ns switch).
-- **Nesting**: Child enclosures can only impose equal or stricter restrictions — no privilege escalation.
-- **Meta-packages**: Packages with identical access rights across all enclosures are clustered into single hardware protection domains, working around MPK's 16-key limit.
+## 你将学到
 
-## Relevance to Shimmy
+- 为什么现代软件中第三方依赖是重大安全风险
+- `with` 关键字如何实现包粒度的运行时隔离
+- MPK 硬件如何在 86 ns 内切换内存保护域
+- 什么是 TCB（可信计算基），以及为什么缩小它很重要
 
-Enclosure validates the idea of hardware-enforced in-process isolation, which is directly applicable to Shimmy's self-hosted deployment mode. The LB_MPK backend (86 ns per switch) shows that MPK-based domain switching is practical for production use. For Shimmy running inside AWS Lambda where kernel primitives are blocked, Enclosure's LitterBox model could be adapted: the `with` construct could isolate student code from the surrounding Lambda function environment using MPK. The paper's treatment of syscall filtering via seccomp-BPF (in LB_MPK) also informs Shimmy's self-hosted sandbox architecture.
+---
 
-## Detailed Notes
+## 摘要
 
-### Problem & Motivation
+Enclosure 是一种编程语言构造，限制不可信库代码访问其不应触及的程序资源。单个 `with [policies] func() { body }` 注解将一个闭包绑定到一个内存视图（哪些包可见）和一个系统调用过滤器（允许哪些系统调用），在运行时由 LitterBox 使用 Intel MPK 或 VT-x 硬件强制执行。针对 Go 和 Python 实现，enclosure 可以用单个注解隔离 16 万行以上的不可信依赖代码，在真实 HTTP 工作负载上开销仅为 1.02×。
 
-Modern software imports hundreds of transitive dependencies whose code is unknown and unverified. Malicious actors inject malware into popular packages (e.g., Python packages stealing SSH/GPG keys). Yet programming languages provide no mechanism to restrict what a library can do at runtime — every package can access every variable, every file descriptor, and every syscall.
+## 核心思想
 
-Existing approaches fail to provide package-granularity, language-integrated, hardware-enforced isolation:
-- OS-level abstractions (processes, containers): require heavy refactoring and IPC marshalling
-- Language-based isolation (Rust ownership, JS isolates): language-specific, increases TCB
-- Hardware memory domains (Erim, Hodor): ignore package structure entirely
+> **💡 什么是 MPK（内存保护键）？**
+> MPK（Memory Protection Keys）是 Intel CPU 的一项硬件特性，允许程序在用户态直接修改内存页的访问权限，无需陷入内核。每个内存页被标记一个 4 位"保护键"（0–15），CPU 中有一个特殊寄存器（PKRU）记录每个键对应的读/写权限。切换保护域只需改写 PKRU——在用户态完成，耗时仅约 86 ns，而不是调用内核的数百纳秒。
 
-### Design & Architecture
+- **包粒度隔离**：包是正确的隔离单元——它们有明确的入口点、显式声明的依赖关系，以及各自的代码/数据/堆。系统从导入图自动计算*最小内存视图*，无需开发者手动枚举内存区域。
+- **`with` 构造**：`with [policies] func() { body }` 是一个动态作用域表达式。策略应用于闭包主体及其传递调用的所有代码，包括通过深层依赖链的调用。违规导致故障。
+- **LitterBox 后端**：一个语言无关的运行时框架，通过硬件强制执行策略。两种后端：LB_MPK（Intel MPK，86 ns 切换）和 LB_VTX（Intel VT-x，924 ns 切换）。
+- **嵌套**：子 enclosure 只能施加等同或更严格的限制——不能进行权限提升。
+- **元包**：在所有 enclosure 中具有相同访问权限的包被聚合为单个硬件保护域，绕过 MPK 的 16 键限制。
 
-**The Enclosure Construct**:
-- `with [policies] func() { body }` — a dynamically scoped expression
-- **Memory view**: Per-package access rights (R, RW, RWX, or U for unmapped). Default: only the closure's natural dependencies (transitive import closure) are accessible.
-- **Syscall filter**: Categories of permitted syscalls (none, all, net, file, mem, etc.). Default: all syscalls prohibited.
-- Memory modifiers can extend the view (e.g., read-only access to a `secrets` package) or restrict it further.
-- Policies are dynamically scoped — apply to the closure body and all transitively invoked code.
+## 与 Shimmy 的关联
 
-**LitterBox Backend APIs**:
-- `Init`: Receives package/enclosure descriptions; creates hardware execution environments
-- `Prolog/Epilog`: Switch into/out of an enclosure's restricted environment
-- `FilterSyscall`: Intercepts and permits/rejects syscalls based on current enclosure filter
-- `Transfer`: Dynamically repartitions heap memory between package arenas
-- `Execute`: Supports user-level thread scheduling across protection environments (critical for Go goroutines)
+Enclosure 验证了硬件强制进程内隔离的思路，这直接适用于 Shimmy 的自托管部署模式。LB_MPK 后端（86 ns 每次切换）表明基于 MPK 的域切换对生产使用是实际可行的。对于在 AWS Lambda 内运行（内核原语被阻塞）的 Shimmy，Enclosure 的 LitterBox 模型可以适配：`with` 构造可以使用 MPK 将学生代码与周围的 Lambda 函数环境隔离。论文对通过 seccomp-BPF 过滤系统调用（在 LB_MPK 中）的处理也为 Shimmy 的自托管沙箱架构提供了参考。
 
-**Hardware Backends**:
+## 详细说明
 
-| Operation | Baseline | LB_MPK | LB_VTX |
+### 问题与动机
+
+> **💡 什么是供应链攻击（supply chain attack）？**
+> 供应链攻击是指攻击者不直接攻击目标软件，而是攻击目标所依赖的第三方库。就像不直接闯入超市，而是在供应商的货物中动手脚。现代应用通常依赖数百个传递性依赖，其中任何一个被投毒，都可能危及整个应用。
+
+现代软件导入数百个传递性依赖，这些代码未知且未经验证。恶意行为者将恶意软件注入热门包（如 Python 包窃取 SSH/GPG 密钥）。然而编程语言没有任何机制在运行时限制库的行为——每个包都可以访问每个变量、每个文件描述符和每个系统调用。
+
+现有方案无法提供包粒度、语言集成、硬件强制的隔离：
+- 操作系统级抽象（进程、容器）：需要大量重构和 IPC 序列化
+- 基于语言的隔离（Rust 所有权、JS isolate）：语言特定，增大 TCB
+- 硬件内存域（Erim、Hodor）：完全忽略包结构
+
+### 设计与架构
+
+**Enclosure 构造**：
+- `with [policies] func() { body }` — 动态作用域表达式
+- **内存视图**：每个包的访问权限（R、RW、RWX 或 U 表示未映射）。默认：只有闭包的自然依赖（传递导入闭包）可访问。
+- **系统调用过滤器**：允许的系统调用类别（none、all、net、file、mem 等）。默认：禁止所有系统调用。
+- 内存修饰符可以扩展视图（如对 `secrets` 包的只读访问）或进一步限制。
+- 策略是动态作用域的——适用于闭包主体及其传递调用的所有代码。
+
+**LitterBox 后端 API**：
+- `Init`：接收包/enclosure 描述；创建硬件执行环境
+- `Prolog/Epilog`：切换进入/退出 enclosure 的受限环境
+- `FilterSyscall`：根据当前 enclosure 过滤器拦截并允许/拒绝系统调用
+- `Transfer`：动态在包 arena 之间重新分区堆内存
+- `Execute`：支持跨保护环境的用户级线程调度（对 Go goroutine 至关重要）
+
+**硬件后端**：
+
+| 操作 | 基准 | LB_MPK | LB_VTX |
 |-----------|----------|--------|--------|
-| call (ns) | 45 | 86 | 924 |
-| transfer (ns) | 0 | 1002 | 158 |
-| syscall (ns) | 387 | 523 | 4126 |
+| 调用（ns）| 45 | 86 | 924 |
+| 传输（ns）| 0 | 1002 | 158 |
+| 系统调用（ns）| 387 | 523 | 4126 |
 
-- **LB_MPK**: Uses 4-bit protection keys in PTEs and user-writable PKRU register. Each enclosure is a PKRU value. Syscall filtering via seccomp-BPF indexed by PKRU. ~86 ns per switch.
-- **LB_VTX**: Runs the application inside a KVM VM. Each enclosure gets a separate page table (CR3). Switches via guest syscalls. Syscall filtering via hypercalls. ~924 ns per switch.
+- **LB_MPK**：使用 PTE 中的 4 位保护键和用户可写 PKRU 寄存器。每个 enclosure 是一个 PKRU 值。通过按 PKRU 索引的 seccomp-BPF 进行系统调用过滤。约 86 ns 每次切换。
+- **LB_VTX**：在 KVM 虚拟机中运行应用程序。每个 enclosure 获得独立的页表（CR3）。通过客户机系统调用切换。通过超调用过滤系统调用。约 924 ns 每次切换。
 
-### Evaluation
+### 评估
 
-**Macrobenchmarks (Go)**:
-- **Bild image processing** (160K LOC dependency): LB_MPK 1.12×, LB_VTX 1.05× slowdown
-- **HTTP server** (net/http): LB_MPK 1.02×, LB_VTX 1.77×
-- **FastHTTP** (350K LOC, 100+ contributors): LB_MPK 1.04×, LB_VTX 2.01×
-- All benchmarks: a single enclosure declaration reduces the TCB from hundreds of thousands of LOC to under 100 LOC
+**宏观基准测试（Go）**：
+- **Bild 图像处理**（16 万行代码依赖）：LB_MPK 1.12×，LB_VTX 1.05× 性能降低
+- **HTTP 服务器**（net/http）：LB_MPK 1.02×，LB_VTX 1.77×
+- **FastHTTP**（35 万行代码，100+ 贡献者）：LB_MPK 1.04×，LB_VTX 2.01×
+- 所有基准测试：单个 enclosure 声明将 TCB 从数十万行代码减少到不足 100 行
 
-**Python**: Conservative approach (switch on every reference count) yields 18× overhead. With relaxed access: 1.4× overhead, dominated by one-time initialization.
+**Python**：保守方案（每次引用计数都切换）产生 18× 开销。使用宽松访问：1.4× 开销，主要由一次性初始化主导。
 
-**Security**: Recreated real-world malicious packages; enclosures detect and block most attacks with default policies.
+**安全性**：重现真实世界恶意包；enclosure 以默认策略检测并阻止大多数攻击。
 
-### Strengths & Weaknesses
+### 优势与局限
 
-**Strengths**:
-1. Minimal developer effort — a single `with` annotation can isolate an entire dependency tree of 160K+ LOC
-2. Language-independent backend cleanly separates language frontends from hardware enforcement
-3. LB_MPK achieves 1.02–1.12× slowdown — deployable in production
-4. Hardware enforcement means even unsafe code (raw memory access, inline assembly) is contained
+**优势**：
+1. 开发者工作量极少——单个 `with` 注解可以隔离 16 万行以上代码的整个依赖树
+2. 语言无关的后端将语言前端与硬件强制清晰分离
+3. LB_MPK 实现 1.02–1.12× 性能降低——可在生产中部署
+4. 硬件强制意味着即使是不安全代码（原始内存访问、内联汇编）也被限制
 
-**Weaknesses**:
-1. **Package granularity only**: Cannot isolate subsets of a package's code or data
-2. **No information flow control**: Code with both sensitive data access and permitted syscalls can still exfiltrate
-3. **Python performance**: CPython's reference count co-location with object data causes 18× overhead in conservative mode
-4. **Intel-specific hardware**: Both backends require Intel VT-x or MPK; ARM and RISC-V not supported
-5. **MPK key limit**: Intel MPK supports only 16 keys; applications with many fine-grained packages may exceed this
+**局限**：
+1. **仅包粒度**：无法隔离包内代码或数据的子集
+2. **无信息流控制**：同时具有敏感数据访问和允许系统调用的代码仍然可以泄露
+3. **Python 性能**：CPython 的引用计数与对象数据共存导致保守模式下 18× 开销
+4. **Intel 特定硬件**：两种后端都需要 Intel VT-x 或 MPK；不支持 ARM 和 RISC-V
+5. **MPK 键限制**：Intel MPK 仅支持 16 个键；具有许多细粒度包的应用可能超出此限制
 
-### Implementation Details
+### 实现细节
 
-- **Go frontend** (1,000 LOC patch): Extends Go parser for `with` keyword; compiler inserts Prolog/Epilog calls; linker segregates marked packages into separate ELF sections; runtime memory allocator assigns spans to per-package arenas
-- **Python frontend** (600 LOC CPython 3.9.1 fork): Handles dynamic module loading via multiple Init calls; introduces `localcopy` for explicit data placement
-- **LitterBox**: 6,500 LOC in Go
+- **Go 前端**（1,000 行补丁）：扩展 Go 解析器以支持 `with` 关键字；编译器插入 Prolog/Epilog 调用；链接器将标记的包分离到单独的 ELF 节；运行时内存分配器将 span 分配到每个包的 arena
+- **Python 前端**（600 行 CPython 3.9.1 分支）：通过多次 Init 调用处理动态模块加载；引入 `localcopy` 用于显式数据放置
+- **LitterBox**：6,500 行 Go 代码
 
-### Glossary
+### 术语表
 
-- **Enclosure**: A language construct binding a closure to a restricted memory view and syscall filter
-- **LitterBox**: The language-independent backend enforcing enclosure policies via hardware
-- **Memory view**: The set of packages (and access rights) visible to code running inside an enclosure
-- **Natural dependencies**: The transitive closure of a package's import graph
-- **Meta-package**: A cluster of packages with identical access rights across all enclosures, managed as a single hardware protection domain
-- **MPK (Memory Protection Keys)**: Intel hardware feature using 4-bit tags in PTEs and a user-writable PKRU register
-- **VT-x**: Intel hardware virtualization extensions; LitterBox uses them to create per-enclosure page tables
-- **TCB (Trusted Codebase)**: The portion of code that runs with unrestricted access to all program resources
+- **Enclosure**：将闭包绑定到受限内存视图和系统调用过滤器的语言构造
+- **LitterBox**：通过硬件强制执行 enclosure 策略的语言无关后端
+- **内存视图（memory view）**：在 enclosure 内部运行的代码可见的包集合（及访问权限）
+- **自然依赖（natural dependencies）**：包的导入图的传递闭包
+- **元包（meta-package）**：在所有 enclosure 中具有相同访问权限的包集群，作为单个硬件保护域管理
+- **MPK（内存保护键）**：Intel 硬件特性，使用 PTE 中的 4 位标签和用户可写 PKRU 寄存器
+- **VT-x**：Intel 硬件虚拟化扩展；LitterBox 用它为每个 enclosure 创建独立页表
+- **TCB（可信代码库）**：以不受限访问运行所有程序资源的代码部分

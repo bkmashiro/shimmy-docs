@@ -1,36 +1,56 @@
-# Lazypoline: System Call Interposition Without Compromise
+# Lazypoline：无妥协的系统调用插桩
 
-**Authors:** Adriaan Jacobs, Merve Gulmez, Alicia Andries, Stijn Volckaert, Alexios Voulimeneas (KU Leuven / Ericsson Security Research / TU Delft)  **Venue:** DSN  **Year:** 2024
+**作者：** Adriaan Jacobs, Merve Gulmez, Alicia Andries, Stijn Volckaert, Alexios Voulimeneas（KU Leuven / Ericsson Security Research / TU Delft）  **发表于：** DSN  **年份：** 2024
 
-## Summary
+---
 
-Lazypoline is the first system call interposition mechanism that is simultaneously exhaustive (intercepts all syscalls, including from JIT-compiled code), expressive (runs arbitrary interposer logic), and efficient (near-pure-binary-rewriting performance). It uses a hybrid design: Syscall User Dispatch (SUD) serves as a slow-path catch-all that discovers new syscall sites on first use, then lazily rewrites them to `call rax` (zpoline-style) for fast subsequent execution. On web server benchmarks, lazypoline maintains 94–95% of baseline throughput while guaranteeing exhaustive interception.
+## 前置知识
 
-## Key Ideas
+- 理解系统调用（syscall）的基本概念
+- 了解 zpoline 的核心思路（见 zpoline.md）
+- 知道什么是信号（signal）——操作系统向进程发送通知的机制
 
-- **Lazy rewriting pattern**: Use a reliable-but-slow mechanism (SUD) to discover syscall sites once, then install a fast mechanism (`call rax` rewriting) for all future executions. The system converges toward pure-rewriting performance as more sites are discovered.
-- **Hybrid slow/fast path**: SUD triggers a SIGSYS on first execution; the signal handler rewrites the 2-byte instruction to `call rax` and redirects RIP to the fast-path interposer. Subsequent calls bypass the kernel entirely.
-- **Selector-only SUD**: Rather than allowlisting code address ranges (which creates security holes), lazypoline sets the selector to ALLOW before returning from the signal handler, reducing the security problem to protecting a single selector byte.
-- **ABI correctness**: Identifies and fixes a real bug in all prior binary rewriters — the x86-64 ABI requires preserving extended state (SSE/AVX/x87 FPU) across syscalls. In Ubuntu 20.04 (glibc 2.31), 40% of coreutils are affected; in Clear Linux (glibc 2.39), 100% are affected. Lazypoline uses `xsave`/`xrstor` to preserve this state.
-- **Exhaustiveness proof**: Demonstrated on Tiny C Compiler JIT — lazypoline and SUD both intercept a syscall embedded in JIT-compiled C code; zpoline misses it entirely.
-- **Minimal implementation**: 1.4K lines of C/C++ and 200 lines of x86-64 assembly.
+## 你将学到
 
-## Relevance to Shimmy
+- 什么是"懒惰重写"（lazy rewriting）模式
+- 为什么 zpoline 不能拦截 JIT 生成的系统调用
+- lazypoline 如何通过慢路径+快路径混合设计解决这一问题
+- ABI 兼容性为什么是系统调用拦截中常被忽视的陷阱
 
-Lazypoline directly advances the state of syscall interception beyond zpoline by solving the exhaustiveness problem for dynamically generated code. For Shimmy's self-hosted deployments (where `mmap_min_addr = 0` and SUD kernel 5.11+ are available), lazypoline would be the recommended DBI-based sandboxing mechanism. The paper's ABI analysis is particularly important — any system that interposes on syscalls in a multi-threaded environment with modern glibc must preserve extended CPU state or face subtle, hard-to-debug failures. The K23 paper (Middleware '25) subsequently identified further pitfalls in lazypoline's implementation, making K23 the most complete solution in this lineage.
+---
 
-## Detailed Notes
+## 摘要
 
-### Problem & Motivation
+Lazypoline 是首个同时满足穷举性（拦截所有系统调用，包括来自 JIT 编译代码的调用）、表达性（运行任意插桩逻辑）和高效性（接近纯二进制重写性能）的系统调用插桩机制。它采用混合设计：Syscall User Dispatch（SUD）充当慢速路径，在首次执行时发现新的系统调用位置，然后"懒惰地"将其重写为 `call rax`（zpoline 风格）以加速后续执行。在 Web 服务器基准测试中，lazypoline 在保证穷举拦截的同时维持了基准吞吐量的 94–95%。
 
-System call interposition must be simultaneously:
-1. **Expressive**: Can run arbitrary logic (deep argument inspection, state modification), not just BPF-limited filtering
-2. **Exhaustive**: Catches *all* syscalls, including from dynamically loaded or JIT-compiled code
-3. **Efficient**: Does not impose prohibitive overhead on syscall-intensive applications
+## 核心思想
 
-No existing mechanism achieves all three:
+> **💡 什么是 JIT 编译（Just-In-Time）？**
+> JIT 编译器（如 JavaScript 引擎 V8、Java 虚拟机）在程序运行时动态生成机器码——这些代码在程序启动时根本不存在。如果在程序启动时扫描所有可执行内存来改写系统调用指令，就会错过这些"运行中才出现"的指令，就像给考场提前搜身，却拦不住中途从窗外递进来的小抄。
 
-| Mechanism | Expressive | Exhaustive | Efficient |
+- **懒惰重写模式**：使用可靠但较慢的机制（SUD）一次性发现系统调用位置，然后为后续所有执行安装快速机制（`call rax` 重写）。随着越来越多的位置被发现，系统逐渐收敛到纯重写的性能。
+- **慢/快路径混合**：SUD 在首次执行时触发 SIGSYS；信号处理程序将两字节指令重写为 `call rax` 并将 RIP 重定向到快路径插桩入口。后续调用完全绕过内核。
+- **仅使用选择器的 SUD**：lazypoline 不对代码地址范围进行白名单（这会产生安全漏洞），而是在信号处理程序返回前将选择器设为 ALLOW，将安全问题缩小为保护单个选择器字节。
+- **ABI 正确性**：发现并修复了所有之前二进制重写器中的一个真实 bug——x86-64 ABI 要求在系统调用期间保留扩展状态（SSE/AVX/x87 FPU）。在 Ubuntu 20.04（glibc 2.31）中，40% 的 coreutils 受影响；在 Clear Linux（glibc 2.39）中，100% 受影响。lazypoline 使用 `xsave`/`xrstor` 保留此状态。
+- **穷举性证明**：在 Tiny C Compiler JIT 上验证——lazypoline 和 SUD 都能拦截嵌入在 JIT 编译 C 代码中的系统调用；zpoline 完全漏掉。
+- **极简实现**：1.4K 行 C/C++ 代码和 200 行 x86-64 汇编。
+
+## 与 Shimmy 的关联
+
+Lazypoline 通过解决动态生成代码的穷举性问题，将系统调用拦截推进到了 zpoline 之上。对于 Shimmy 的自托管部署（其中 `mmap_min_addr = 0` 且 SUD 需要内核 5.11+），lazypoline 将是推荐的 DBI 沙箱机制。论文的 ABI 分析尤为重要——任何在多线程环境中使用现代 glibc 对系统调用进行插桩的系统，都必须保留扩展 CPU 状态，否则会遭遇难以调试的细微故障。K23 论文（Middleware '25）随后指出了 lazypoline 实现中的更多陷阱，使 K23 成为这一技术谱系中最完整的方案。
+
+## 详细说明
+
+### 问题与动机
+
+系统调用插桩必须同时满足：
+1. **表达性**：可运行任意逻辑（深层参数检查、状态修改），而不仅限于 BPF 过滤
+2. **穷举性**：捕获*所有*系统调用，包括来自动态加载或 JIT 编译代码的调用
+3. **高效性**：不对系统调用密集型应用造成难以接受的开销
+
+没有任何现有机制同时满足这三点：
+
+| 机制 | 表达性 | 穷举性 | 高效性 |
 |-----------|-----------|-----------|----------|
 | ptrace | ✓ | ✓ | ✗ (31,201 ns) |
 | seccomp-BPF | ✗ | ✓ | ✓ |
@@ -38,73 +58,76 @@ No existing mechanism achieves all three:
 | zpoline | ✓ | ✗ | ✓ (~41 ns) |
 | **lazypoline** | **✓** | **✓** | **✓** |
 
-### Design & Architecture
+### 设计与架构
 
-**Slow path (SUD-based)**: When an application executes a syscall instruction for the first time:
-1. SUD triggers SIGSYS
-2. Signal handler rewrites the syscall instruction to `call rax` (zpoline-style)
-3. Modifies signal context's RIP to point to the fast-path interposer entry
-4. Returns from handler with selector set to ALLOW, causing the interposer to execute without re-triggering SUD
+> **💡 什么是 SUD（Syscall User Dispatch）？**
+> SUD 是 Linux 5.11 引入的内核机制。程序可以告诉内核：当我发起系统调用时，不要直接执行，而是先向我发送一个 SIGSYS 信号让我处理。这样程序就能"拦截"自己的系统调用——代价是每次都要经过信号处理，速度较慢。
 
-**Fast path (zpoline-based)**: On subsequent executions, the rewritten `call rax` instruction jumps to virtual address 0..N (syscall number), slides through a nop sled, and lands in the interposer (~41 ns overhead).
+**慢速路径（基于 SUD）**：当应用程序首次执行某个 syscall 指令时：
+1. SUD 触发 SIGSYS
+2. 信号处理程序将 syscall 指令重写为 `call rax`（zpoline 风格）
+3. 修改信号上下文中的 RIP，使其指向快路径插桩入口
+4. 将选择器设为 ALLOW 后从处理程序返回，使插桩逻辑执行而不再次触发 SUD
 
-The slow path remains constantly enabled to discover new syscall sites (e.g., newly loaded libraries or JIT-compiled code). Over time, the vast majority of syscalls take the fast path.
+**快速路径（基于 zpoline）**：后续执行时，重写后的 `call rax` 跳转到虚拟地址 0..N（系统调用号），滑过 nop 滑道，到达插桩逻辑（约 41 ns 开销）。
 
-**Selector-only SUD**: Lazypoline never allowlists code address ranges — doing so would create security weaknesses (attackers could jump to allowlisted syscalls). Instead, it sets the selector to ALLOW before returning from the signal handler and uses `REG_RIP` modification to redirect execution. This reduces the security problem to protecting a single selector byte, solvable with MPK or similar mechanisms.
+慢速路径始终保持启用状态，以发现新的系统调用位置（如新加载的库或 JIT 编译代码）。随着时间推移，绝大多数系统调用走快速路径。
 
-**ABI compatibility**: Extended state (`xstate`) — SSE/AVX/x87 FPU registers — must be preserved across syscalls per the x86-64 ABI. Prior binary rewriters (zpoline, SaBRe) do not preserve this, causing subtle failures. Lazypoline defaults to preserving all extended state, with a configurable option to skip for performance-sensitive interposers.
+**仅使用选择器的 SUD**：lazypoline 从不对代码地址范围进行白名单——这样做会产生安全弱点（攻击者可以跳转到白名单中的系统调用）。相反，它在从信号处理程序返回前将选择器设为 ALLOW，并使用 `REG_RIP` 修改重定向执行。这将安全问题缩小为保护单个选择器字节，可用 MPK 或类似机制解决。
 
-**Per-task state**: Each thread gets its own `%gs`-relative selector byte, xstate save area (managed as a stack for nested invocations), and sigreturn stack for signal handling.
+**ABI 兼容性**：扩展状态（`xstate`）——SSE/AVX/x87 FPU 寄存器——必须根据 x86-64 ABI 在系统调用期间保留。之前的二进制重写器（zpoline、SaBRe）不保留此状态，导致细微故障。lazypoline 默认保留所有扩展状态，并为对性能敏感的插桩提供可配置的跳过选项。
 
-### Evaluation
+**每任务状态**：每个线程拥有自己的 `%gs` 相对选择器字节、xstate 保存区域（作为嵌套调用的栈管理）和用于信号处理的 sigreturn 栈。
 
-**Hardware**: 48-core Intel Xeon Gold 5318S, 1 TiB RAM, Ubuntu 22.04, Linux 5.15.
+### 评估
 
-#### Microbenchmarks (100M non-existent syscall invocations)
+**硬件**：48 核 Intel Xeon Gold 5318S，1 TiB RAM，Ubuntu 22.04，Linux 5.15。
 
-| Mechanism | Overhead vs. baseline |
+#### 微基准测试（1 亿次不存在的系统调用）
+
+| 机制 | 相对基准开销 |
 |-----------|----------------------|
 | zpoline | 1.23× |
-| lazypoline (no xstate) | 1.66× |
-| lazypoline (with xstate) | 2.38× |
+| lazypoline（不保留 xstate）| 1.66× |
+| lazypoline（保留 xstate）| 2.38× |
 | SUD | 20.8× |
-| baseline + SUD enabled | 1.42× |
+| 基准 + 仅启用 SUD | 1.42× |
 
-The 1.42× overhead of merely enabling SUD (even for non-intercepted syscalls) is a kernel-level cost that lazypoline cannot eliminate.
+仅启用 SUD（即使对未被拦截的系统调用）就带来 1.42× 的开销，这是内核层面的代价，lazypoline 无法消除。
 
-#### Web Server Benchmarks (nginx, lighttpd)
+#### Web 服务器基准测试（nginx、lighttpd）
 
-- **nginx (1 worker)**: lazypoline (no xstate) ~94.7%, lazypoline (with xstate) ~90.0%, SUD significantly lower
-- **lighttpd (1 worker)**: lazypoline (no xstate) ~94.8%
-- From 64 KB files onward, the difference between zpoline and lazypoline practically vanishes
+- **nginx（1 个 worker）**：lazypoline（不保留 xstate）约 94.7%，lazypoline（保留 xstate）约 90.0%，SUD 显著更低
+- **lighttpd（1 个 worker）**：lazypoline（不保留 xstate）约 94.8%
+- 从 64 KB 文件起，zpoline 和 lazypoline 的差异实际上消失
 
-### Strengths & Weaknesses
+### 优势与局限
 
-**Strengths**:
-1. First to achieve all three properties simultaneously without kernel/hardware modifications
-2. Elegant lazy rewriting converges to optimal performance as syscall sites are discovered
-3. Identifies and fixes a real ABI compatibility bug affecting all prior binary rewriters
-4. Practical security model — reducing SUD attack surface to a single selector byte
+**优势**：
+1. 首个在不修改内核/硬件的情况下同时满足三个属性的方案
+2. 优雅的懒惰重写随系统调用位置被发现而收敛到最优性能
+3. 识别并修复了影响所有之前二进制重写器的真实 ABI 兼容性 bug
+4. 实用的安全模型——将 SUD 攻击面缩减为单个选择器字节
 
-**Weaknesses**:
-1. **Linux/x86-64 only**: SUD is Linux-specific; zpoline technique requires variable-length instructions
-2. **Enabling SUD has inherent cost**: 1.42× overhead even for non-intercepted syscalls (kernel-level cost)
-3. **No security guarantees by default**: Selector byte, nop sled, and interposer state are in the same address space as the application
-4. **First-execution penalty**: First invocation of each unique syscall site takes the slow path (~20× overhead)
+**局限**：
+1. **仅限 Linux/x86-64**：SUD 是 Linux 特有的；zpoline 技术需要变长指令
+2. **启用 SUD 有固有代价**：即使对未被拦截的系统调用也有 1.42× 开销（内核层面代价）
+3. **默认无安全保证**：选择器字节、nop 滑道和插桩状态与应用程序处于同一地址空间
+4. **首次执行惩罚**：每个唯一系统调用位置的首次调用走慢速路径（约 20× 开销）
 
-The K23 paper (Middleware '25) identified additional pitfalls in lazypoline's implementation: LD_PRELOAD bypass (P1a), SUD disabling via prctl (P1b), attack-induced misidentification (P3b), missing NULL execution checks (P4a), and concurrent runtime rewriting issues (P5).
+K23 论文（Middleware '25）指出了 lazypoline 实现中的额外陷阱：LD_PRELOAD 绕过（P1a）、通过 prctl 禁用 SUD（P1b）、攻击诱导的误识别（P3b）、缺少 NULL 执行检查（P4a）以及并发运行时重写问题（P5）。
 
-### Relation to Other Work
+### 与其他工作的关系
 
-Lazypoline directly builds on zpoline (ATC 2023) for its fast path and SUD for its slow path. It directly addresses zpoline's fundamental limitation (non-exhaustiveness for dynamic code) while maintaining its performance advantage. The subsequent K23 paper (Clair Obscur, Middleware '25) identifies remaining pitfalls in lazypoline and presents a more complete solution through offline+online phase hybrid design.
+lazypoline 直接在 zpoline（ATC 2023）的基础上构建快速路径，以 SUD 作为慢速路径。它直接解决了 zpoline 的根本局限（对动态代码不穷举），同时保持其性能优势。后续的 K23 论文（Clair Obscur，Middleware '25）指出了 lazypoline 中剩余的陷阱，并通过离线+在线阶段混合设计提出了更完整的方案。
 
-### Glossary
+### 术语表
 
-- **Lazypoline**: Hybrid syscall interposition using SUD as slow-path discovery + zpoline-style fast path
-- **SUD (Syscall User Dispatch)**: Linux 5.11+ kernel interface that raises SIGSYS when a process invokes a syscall
-- **Slow path**: SUD-triggered signal handler that discovers and rewrites a new syscall site
-- **Fast path**: The rewritten `call rax` instruction that jumps directly to the interposer
-- **xstate**: Extended CPU state including SSE, AVX, and x87 FPU registers
-- **SIGSYS**: Signal raised by SUD when an application invokes a syscall with selector set to BLOCK
-- **Selector byte**: Per-task user-space byte that SUD checks; ALLOW lets syscalls pass, BLOCK triggers SIGSYS
-- **Exhaustiveness**: The ability to intercept all invoked syscalls, including dynamically generated code
+- **lazypoline**：使用 SUD 作为慢路径发现机制 + zpoline 风格快路径的混合系统调用插桩方案
+- **SUD（Syscall User Dispatch）**：Linux 5.11+ 内核接口，当进程发起系统调用时触发 SIGSYS
+- **慢路径**：基于 SUD 的信号处理程序，发现并重写新的系统调用位置
+- **快路径**：重写后的 `call rax` 指令，直接跳转到插桩函数
+- **xstate**：扩展 CPU 状态，包括 SSE、AVX 和 x87 FPU 寄存器
+- **SIGSYS**：当应用程序在选择器设为 BLOCK 时发起系统调用，SUD 触发的信号
+- **选择器字节**：SUD 检查的每任务用户态字节；ALLOW 让系统调用通过，BLOCK 触发 SIGSYS
+- **穷举性**：拦截所有被调用的系统调用（包括动态生成代码）的能力

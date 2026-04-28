@@ -1,70 +1,93 @@
-# SigmaOS: Unifying Serverless and Microservice Tasks
+# SigmaOS：统一无服务器与微服务任务
 
-**Authors:** Ariel Szekely, Adam Belay, Robert Morris, M. Frans Kaashoek (MIT CSAIL)  **Venue:** SOSP  **Year:** 2024
+**作者：** Ariel Szekely, Adam Belay, Robert Morris, M. Frans Kaashoek（MIT CSAIL）  **发表于：** SOSP  **年份：** 2024
 
-## Summary
+---
 
-SigmaOS (σOS) is a new multi-tenant cloud operating system that unifies serverless functions and microservices under a single platform. Its core insight is that cloud-native applications depend primarily on cloud infrastructure rather than local OS features, so a minimal shared filesystem image suffices and network namespaces can be replaced by a lightweight endpoint abstraction (σEP). By eliminating overlay filesystem creation, network namespace setup, and using a 67-syscall whitelist, σOS achieves 7.7 ms cold starts, 36,650 procs/sec scheduling throughput, and established-connection performance identical to uncontained networking.
+## 前置知识
 
-## Key Ideas
+- 了解无服务器计算和微服务的基本概念
+- 理解容器（如 Docker）是什么
+- 知道系统调用和进程隔离的基本概念
 
-- **σEP (sigma endpoint)**: Replaces IP addresses and overlay networks. Connection establishment is brokered by a local `dialproxyd` that verifies tenant identity; after that, processes communicate via direct TCP socket passing. This eliminates the persistent overhead of overlay networks while preserving tenant isolation.
-- **Unified proc abstraction**: All computation is expressed as procs — whether short-lived serverless functions or long-running microservices. `Spawn(descriptor)` queues the request; schedulers handle placement.
-- **σ container**: Lightweight container that skips overlay filesystem creation (~5 ms savings) and network namespace setup (~100 ms savings). Creates only UTS/IPC/PID namespaces; uses FUSE-based binfs for demand-paging binary files from S3.
-- **67-syscall whitelist**: σOS restricts each proc to 67 syscalls via seccomp-BPF — compared to Docker's 352 and Kubernetes' 340. All network syscalls (socket, connect, bind, accept, listen) are blocked; connections go through dialproxyd.
-- **Two-level scheduling**: `lcsched` globally places latency-critical (LC) procs with CPU/memory reservations; `besched` shards distribute best-effort (BE) procs, with machines proactively pulling work.
+## 你将学到
 
-## Relevance to Shimmy
+- 容器启动为什么慢，以及如何从根源上解决
+- 什么是 σEP（sigma endpoint）及其如何替代传统网络命名空间
+- 67 个系统调用白名单能达到什么样的安全级别
+- 延迟关键（LC）与尽力而为（BE）调度的区别
 
-σOS demonstrates that aggressive syscall reduction (67 vs. 352) combined with architectural alternatives to network namespaces can drastically reduce sandbox creation cost. For Shimmy, the key lessons are: (1) seccomp-BPF with a very short whitelist is practical and measurably reduces attack surface — the 67-syscall approach is a concrete design target for self-hosted Shimmy; (2) eliminating overlay filesystems and network namespaces from the sandbox creation path saves 100+ ms; (3) the LC/BE scheduling distinction is directly applicable to Shimmy's workload where interactive API requests (LC) and background grading tasks (BE) have fundamentally different latency requirements. Note that σOS's seccomp filter approach is not viable inside Lambda (where seccomp installation is blocked), but it is directly usable in Shimmy's self-hosted tier.
+---
 
-## Detailed Notes
+## 摘要
 
-### Problem & Motivation
+SigmaOS（σOS）是一个新型多租户云操作系统，将无服务器函数和微服务统一在单一平台下。其核心洞见是：云原生应用主要依赖云基础设施而非本地操作系统特性，因此一个最小化共享文件系统镜像就足够了，网络命名空间可以被轻量级端点抽象（σEP）替代。通过消除叠加文件系统创建、网络命名空间配置，并使用 67 系统调用白名单，σOS 实现了 7.7 ms 冷启动、36,650 进程/秒的调度吞吐量，以及与无隔离网络完全相同的已建立连接性能。
 
-Cloud applications need both:
-1. **Microservices**: Long-running, stateful, needing communication and performance guarantees — Kubernetes is good, but instance startup is too slow (seconds) for burst parallelism
-2. **Serverless functions**: Short-lived, stateless, massively parallel — Lambda is fast but doesn't support direct communication, long-lived state, or resource reservations
+## 核心思想
 
-No platform simultaneously provides the generality of container orchestration and the fast startup of serverless.
+> **💡 什么是叠加文件系统（overlay filesystem）？**
+> 叠加文件系统是容器技术的关键组件之一。它允许容器在不修改基础镜像的情况下看到一个"私有"的文件系统视图——就像给一本书套上一层可写的透明膜，在透明膜上写字，原书不受影响。创建这个叠加层大约需要 5 ms，是容器启动延迟的重要来源。
 
-**Why containers start slowly**:
-1. Creating an isolated read-write filesystem from an application-specific container image
-2. Configuring an IP address and isolated overlay network for each instance
-3. Insufficient scheduling infrastructure speed
+- **σEP（sigma 端点）**：替代 IP 地址和叠加网络。连接建立由本地 `dialproxyd` 代理，验证租户身份；之后进程通过直接传递 TCP 套接字通信。这消除了叠加网络的持久开销，同时保留租户隔离。
+- **统一进程抽象**：所有计算以进程（proc）表示——无论是短期无服务器函数还是长期微服务。`Spawn(descriptor)` 将请求排队；调度器处理放置。
+- **σ 容器**：轻量级容器，跳过叠加文件系统创建（节省约 5 ms）和网络命名空间配置（节省约 100 ms）。仅创建 UTS/IPC/PID 命名空间；使用基于 FUSE 的 binfs 按需从 S3 分页加载二进制文件。
+- **67 系统调用白名单**：σOS 通过 seccomp-BPF 将每个进程限制为 67 个系统调用——对比 Docker 的 352 个和 Kubernetes 的 340 个。所有网络系统调用（socket、connect、bind、accept、listen）均被阻塞；连接通过 dialproxyd 进行。
+- **两级调度**：`lcsched` 全局放置延迟关键（LC）进程，带 CPU/内存预留；`besched` 分片分发尽力而为（BE）进程，机器主动拉取工作。
 
-### Design & Architecture
+## 与 Shimmy 的关联
 
-**proc**: The unified compute unit. `Spawn(descriptor)` includes binary path, arguments, LC/BE tag, CPU reservation, memory reservation, optional failure domain.
+σOS 证明了激进的系统调用削减（67 vs. 352）结合网络命名空间的架构替代方案可以大幅降低沙箱创建成本。对于 Shimmy，关键经验是：(1) 使用很短白名单的 seccomp-BPF 是可行的，可以显著减少攻击面——67 系统调用方案是自托管 Shimmy 的具体设计目标；(2) 从沙箱创建路径中消除叠加文件系统和网络命名空间节省了 100+ ms；(3) LC/BE 调度区分直接适用于 Shimmy 的工作负载，其中交互式 API 请求（LC）和后台评分任务（BE）有根本不同的延迟要求。注意 σOS 的 seccomp 过滤方案在 Lambda 内部不可行（seccomp 安装被阻塞），但可以直接用于 Shimmy 的自托管层。
 
-Key departure from conventional systems: σOS does **not** automatically restart procs after failure. If a scheduling component crashes during proc creation, `WaitStart`/`WaitExit` return errors; callers decide whether to re-`Spawn`. This reduces creation cost.
+## 详细说明
 
-**σEP**: Replaces overlay networks.
-- Server calls `NewSigmaEP()`, writes σEP to named service, calls `Accept(Listener)`
-- Client reads σEP from named service, calls `Dial(σEP)`
-- Both sides IPC to local `dialproxyd`; it verifies both procs belong to the same realm, then passes the TCP socket file descriptor directly to each process
-- After setup, dialproxyd is not on the data path — data flows directly between processes
+### 问题与动机
 
-**σ container creation steps**:
-1. Only UTS/IPC/PID namespaces (not network)
-2. Jail proc into filesystem with a few read-only config files + `/proc` + FUSE `binfs`
-3. Seccomp: allow exactly 67 syscalls (memory, threads, signals, random, timers); block all network syscalls
-4. AppArmor: drop all Linux capabilities
-5. Assign to pre-created cgroup pool (avoids cgroup creation on the critical path)
+云应用需要两者：
+1. **微服务**：长期运行、有状态、需要通信和性能保证——Kubernetes 不错，但实例启动对突发并行性来说太慢（秒级）
+2. **无服务器函数**：短期、无状态、大规模并行——Lambda 速度快但不支持直接通信、长期状态或资源预留
 
-**binfs**: FUSE server that demand-pages proc binary files from S3 or local disk cache. First run: read from S3, cache to local disk. Subsequent runs: direct from cache.
+没有平台能同时提供容器编排的通用性和无服务器的快速启动。
 
-**Scheduling**:
-- **LC procs**: `lcsched` (single global) tracks reserved CPU+RAM per machine; places LC procs where reservations are available
-- **BE procs**: Multiple `besched` shards; machines proactively pull work from random shards
+**容器启动慢的原因**：
+1. 从应用特定容器镜像创建隔离的读写文件系统
+2. 为每个实例配置 IP 地址和隔离叠加网络
+3. 调度基础设施速度不足
 
-### Evaluation
+### 设计与架构
 
-**Hardware**: AWS EC2 m6i.4xlarge (16 vCPU, 64 GiB RAM), CloudLab c220g5.
+> **💡 什么是 seccomp-BPF？**
+> seccomp-BPF 是 Linux 内核的系统调用过滤机制。程序可以安装一个 BPF（伯克利数据包过滤器）程序，在每次系统调用前运行：允许通过、返回错误、或杀死进程。就像海关检查——只有持有正确"签证"（系统调用号在白名单里）的请求才能通过，其余一律拒绝。
 
-**Startup latency**:
+**proc**：统一的计算单元。`Spawn(descriptor)` 包含二进制路径、参数、LC/BE 标签、CPU 预留、内存预留、可选故障域。
 
-| Platform | Cold start (ms) | Warm start (ms) |
+与传统系统的关键区别：σOS 在进程故障后**不**自动重启。如果调度组件在进程创建期间崩溃，`WaitStart`/`WaitExit` 返回错误；调用者决定是否重新 `Spawn`。这降低了创建成本。
+
+**σEP**：替代叠加网络。
+- 服务端调用 `NewSigmaEP()`，将 σEP 写入命名服务，调用 `Accept(Listener)`
+- 客户端从命名服务读取 σEP，调用 `Dial(σEP)`
+- 双方都与本地 `dialproxyd` 进行 IPC；它验证两个进程属于同一领域，然后直接将 TCP 套接字文件描述符传给各进程
+- 建立后，dialproxyd 不在数据路径上——数据直接在进程间流动
+
+**σ 容器创建步骤**：
+1. 仅创建 UTS/IPC/PID 命名空间（非网络）
+2. 将进程关入包含少量只读配置文件 + `/proc` + FUSE `binfs` 的文件系统
+3. seccomp：允许恰好 67 个系统调用（内存、线程、信号、随机数、计时器）；阻塞所有网络系统调用
+4. AppArmor：丢弃所有 Linux 权限
+5. 分配到预创建的 cgroup 池（避免在关键路径上创建 cgroup）
+
+**binfs**：FUSE 服务器，从 S3 或本地磁盘缓存按需分页加载进程二进制文件。首次运行：从 S3 读取，缓存到本地磁盘。后续运行：直接从缓存读取。
+
+**调度**：
+- **LC 进程**：`lcsched`（单一全局）追踪每台机器的预留 CPU+RAM；在预留可用的地方放置 LC 进程
+- **BE 进程**：多个 `besched` 分片；机器主动从随机分片拉取工作
+
+### 评估
+
+**硬件**：AWS EC2 m6i.4xlarge（16 vCPU，64 GiB RAM），CloudLab c220g5。
+
+**启动延迟**：
+
+| 平台 | 冷启动（ms）| 热启动（ms）|
 |----------|----------------|----------------|
 | σOS | 7.7 | 2.0 |
 | AWS Lambda | 1,290 | 46 |
@@ -73,69 +96,69 @@ Key departure from conventional systems: σOS does **not** automatically restart
 | Mitosis | 3.1 | 2.8 |
 | Faasm | 8.8 | 0.3 |
 
-σOS warm start (2.0 ms) is dramatically faster than Docker/K8s/Lambda. Faasm warm start (0.3 ms) is faster but relies on WASM runtime isolation rather than independent address spaces.
+σOS 热启动（2.0 ms）远快于 Docker/K8s/Lambda。Faasm 热启动（0.3 ms）更快，但依赖 WASM 运行时隔离而非独立地址空间。
 
-**Hot start breakdown** (BE proc):
+**热启动分解**（BE 进程）：
 
-| Operation | Time (ms) |
+| 操作 | 时间（ms）|
 |-----------|----------|
-| Scheduling placement | 0.42 |
-| Linux namespaces | 0.28 |
-| Filesystem jail | 0.42 |
-| Seccomp filter | 0.46 |
+| 调度放置 | 0.42 |
+| Linux 命名空间 | 0.28 |
+| 文件系统关入 | 0.42 |
+| seccomp 过滤器 | 0.46 |
 | AppArmor | 0.02 |
 | exec | 0.37 |
-| **Total** | **1.97** |
+| **合计** | **1.97** |
 
-Seccomp filter installation (0.46 ms) is the most expensive single operation.
+seccomp 过滤器安装（0.46 ms）是最昂贵的单个操作。
 
-**Scheduling throughput**:
+**调度吞吐量**：
 
-| Component | Max throughput (procs/sec) |
+| 组件 | 最大吞吐量（进程/秒）|
 |-----------|--------------------------|
 | lcsched | 50,144 |
-| Single besched shard | 53,306 |
-| Single machine proc creation | 1,590 |
-| 24-machine cluster end-to-end | 36,650 |
+| 单个 besched 分片 | 53,306 |
+| 单台机器进程创建 | 1,590 |
+| 24 台机器集群端到端 | 36,650 |
 
-Single-machine bottleneck: Linux mount namespace creation requires a global lock.
+单台机器瓶颈：Linux 挂载命名空间创建需要全局锁。
 
-**σEP network performance**:
+**σEP 网络性能**：
 
-| Metric | σOS σEP | No isolation | Docker overlay | K8s overlay |
+| 指标 | σOS σEP | 无隔离 | Docker 叠加 | K8s 叠加 |
 |--------|---------|-------------|----------------|-------------|
-| Dial latency (μs) | 659 | 131 | 413 | 195 |
-| Per-packet latency (μs) | 53 | 53 | 85 | 80 |
-| Throughput (Gb/s) | 8.96 | 8.96 | 7.84 | 5.12 |
+| 连接建立延迟（μs）| 659 | 131 | 413 | 195 |
+| 每包延迟（μs）| 53 | 53 | 85 | 80 |
+| 吞吐量（Gb/s）| 8.96 | 8.96 | 7.84 | 5.12 |
 
-After connection establishment, σEP latency and throughput are identical to uncontained networking.
+建立连接后，σEP 延迟和吞吐量与无隔离网络完全相同。
 
-**Application benchmarks** (DeathStarBench hotel, 8-machine CloudLab):
-- σOS vs. K8s: p99 latency reduced 42%, peak throughput 1.68× higher
-- σOS socialnet vs. K8s: p99 latency reduced 47%, peak throughput 3.01× higher
+**应用基准测试**（DeathStarBench hotel，8 台机器 CloudLab）：
+- σOS vs. K8s：p99 延迟降低 42%，峰值吞吐量高 1.68×
+- σOS socialnet vs. K8s：p99 延迟降低 47%，峰值吞吐量高 3.01×
 
-### Strengths & Weaknesses
+### 优势与局限
 
-**Strengths**:
-1. Radical reduction in startup cost by eliminating overlay filesystem and network namespace (the two slowest operations)
-2. σEP provides tenant isolation with zero cost to established connections vs. uncontained networking
-3. Unified LC/BE scheduling with resource guarantees
-4. 67-syscall whitelist is a concrete, auditable security design
+**优势**：
+1. 通过消除叠加文件系统和网络命名空间（最慢的两个操作）从根源上降低启动成本
+2. σEP 提供零成本的租户隔离，对已建立连接的开销与无隔离网络完全相同
+3. 带资源保证的统一 LC/BE 调度
+4. 67 系统调用白名单是具体的、可审计的安全设计
 
-**Weaknesses**:
-1. Not backward-compatible — existing applications must be ported to the σOS API
-2. Limited authorization model — only AWS S3 tokens and 9P ACLs; no fine-grained authorization
-3. Go runtime startup adds ~15 ms for Go-based procs (worked around in evaluation)
-4. Mount namespace creation global lock limits single-machine throughput to 1,590 procs/sec
+**局限**：
+1. 不向后兼容——现有应用必须移植到 σOS API
+2. 有限的授权模型——仅 AWS S3 令牌和 9P ACL；无细粒度授权
+3. Go 运行时启动为基于 Go 的进程增加约 15 ms（评估中已绕过）
+4. 挂载命名空间创建全局锁将单台机器吞吐量限制为每秒 1,590 个进程
 
-### Glossary
+### 术语表
 
-- **proc**: σOS's unified compute unit — may be serverless function or long-running microservice
-- **σEP (sigma endpoint)**: Network endpoint abstraction replacing IP+overlay; connection brokered by dialproxyd, then direct
-- **σ container**: Lightweight isolation container without overlay filesystem or network namespace; uses seccomp 67-syscall whitelist
-- **realm**: Per-tenant isolation and global namespace unit (based on etcd + Raft)
-- **dialproxyd**: Per-machine proxy that brokers connection establishment and verifies tenant identity
-- **binfs**: FUSE server that demand-pages proc binaries from S3 or local cache
-- **LC (latency-critical)**: Proc type with CPU and memory reservations; scheduled globally by lcsched
-- **BE (best-effort)**: Proc type using unreserved resources and idle LC reservations; scheduled by besched shards
-- **named**: Per-tenant naming service (based on etcd) for service discovery and shared state
+- **proc**：σOS 的统一计算单元——可以是无服务器函数或长期运行的微服务
+- **σEP（sigma 端点）**：替代 IP+叠加的网络端点抽象；连接由 dialproxyd 代理，然后直连
+- **σ 容器**：没有叠加文件系统或网络命名空间的轻量级隔离容器；使用 seccomp 67 系统调用白名单
+- **领域（realm）**：每租户隔离和全局命名空间单元（基于 etcd + Raft）
+- **dialproxyd**：每机器代理，代理连接建立并验证租户身份
+- **binfs**：从 S3 或本地缓存按需分页加载进程二进制文件的 FUSE 服务器
+- **LC（延迟关键）**：带 CPU 和内存预留的进程类型；由 lcsched 全局调度
+- **BE（尽力而为）**：使用未预留资源和空闲 LC 预留的进程类型；由 besched 分片调度
+- **named**：每租户命名服务（基于 etcd），用于服务发现和共享状态

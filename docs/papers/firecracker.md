@@ -1,183 +1,208 @@
-# Firecracker: Lightweight Virtualization for Serverless Applications
+# Firecracker：面向无服务器应用的轻量级虚拟化
 
-**Authors:** Alexandru Agache, Marc Brooker, Andreea Florescu, Alexandra Iordache, Anthony Liguori, Rolf Neugebauer, Phil Piwonka, Diana-Maria Popa (Amazon Web Services)  **Venue:** NSDI  **Year:** 2020
+**作者：** Alexandru Agache, Marc Brooker, Andreea Florescu, Alexandra Iordache, Anthony Liguori, Rolf Neugebauer, Phil Piwonka, Diana-Maria Popa（Amazon Web Services）  **发表于：** NSDI  **年份：** 2020
 
-## Summary
+---
 
-Firecracker is a lightweight Virtual Machine Monitor (VMM) developed by AWS for serverless and container workloads. Its core insight is that specialization enables extreme efficiency: by replacing QEMU's 1.4M-line codebase with ~50K lines of Rust and eliminating every feature not needed for serverless (BIOS, legacy devices, PCI, VM migration, Windows), Firecracker achieves ~3 MB per-MicroVM memory overhead, 125 ms startup time, and the isolation strength of hardware virtualization. It is deployed in production for AWS Lambda and Fargate, handling trillions of requests per month.
+## 前置知识
 
-## Key Ideas
+- 理解进程和操作系统的基本概念
+- 知道什么是虚拟机（VM）——模拟完整计算机的软件
+- 了解 Lambda 或"无服务器计算"的基本概念
 
-- **Extreme specialization**: No BIOS, no PCI bus, no legacy devices, no VM migration, no Windows support. Each removed feature reduces code size, attack surface, and resource overhead simultaneously.
-- **Four virtualized devices only**: virtio block (~1400 lines Rust), virtio net (similar), serial console (~250 lines), partial i8042 PS/2 controller (<50 lines). Block device chosen over filesystem passthrough to minimize host kernel attack surface.
-- **Jailer**: A secondary security layer that sandboxes the Firecracker VMM process itself before it launches the guest — chroot with minimal files, PID + network namespaces, dropped capabilities, 24-syscall + 30-ioctl seccomp-BPF whitelist.
-- **Soft allocation with oversubscription**: CPU and memory allocated on demand; tested at up to 20× oversubscription ratios. Idle MicroVMs consume only memory, not CPU.
-- **Pre-warmed pool sizing via Little's Law**: Maintenance of a small pre-started MicroVM pool using `L = λW` (creation rate × creation latency) to hide startup latency.
-- **Dependency on Linux, not reimplementation**: Scheduling, memory management, and networking delegated to the Linux host kernel, keeping Firecracker's own codebase minimal and auditable.
+## 你将学到
 
-## Relevance to Shimmy
+- Firecracker 如何通过极度精简实现极低开销
+- 什么是 MicroVM，它和传统虚拟机有何不同
+- AWS Lambda 的安全架构为何让内部沙箱如此困难
+- 冷启动问题及其解决思路
 
-Firecracker is the isolation substrate that AWS Lambda runs on, making it the direct context for all of Shimmy's Lambda-mode constraints. The Jailer's 24-syscall seccomp-BPF whitelist is what the Shimmy guest kernel sees — this is why `ptrace`, `seccomp`, `user namespaces`, `chroot`, and `eBPF` are unavailable inside Lambda. Understanding Firecracker's architecture explains Shimmy's constraints from first principles rather than treating them as arbitrary.
+---
 
-The paper also provides Shimmy's design baseline: if 3 MB overhead and 125 ms cold start are acceptable for Lambda's general-purpose functions, Shimmy's specialized student code sandboxes (which need less capability) can target substantially lower numbers by using lighter mechanisms (WASM, rlimits-only). Firecracker's soft allocation model also validates Shimmy's cost analysis: idle warm sandboxes cost only their memory footprint, making pre-warming economical only when memory cost < latency-reduction value.
+## 摘要
 
-## Detailed Notes
+Firecracker 是 AWS 为无服务器和容器工作负载开发的轻量级虚拟机监视器（VMM）。其核心洞见是：专业化能带来极端高效——通过将 QEMU 的 140 万行代码库替换为约 5 万行 Rust 代码，并去除无服务器不需要的每一项功能（BIOS、传统设备、PCI、虚拟机迁移、Windows），Firecracker 实现了每个 MicroVM 约 3 MB 内存开销、125 ms 启动时间，以及硬件虚拟化级别的隔离强度。它已在生产中部署于 AWS Lambda 和 Fargate，每月处理数万亿次请求。
 
-### Problem & Motivation
+## 核心思想
 
-Serverless computing and containers depend on multi-tenancy — running workloads from different customers on the same hardware to maximize utilization. Multi-tenancy requires two kinds of isolation:
+> **💡 什么是虚拟机监视器（VMM）？**
+> VMM（也叫 hypervisor/虚拟机管理程序）是在真实硬件和虚拟机之间的软件层。它让多个"虚拟计算机"共享同一台物理机，每个虚拟机都以为自己独占了整台机器。Firecracker 是专为云函数设计的极简 VMM。
 
-1. **Security isolation**: Prevent one workload from accessing or inferring another's data, including defense against privilege escalation, information disclosure, and covert channel attacks.
-2. **Performance isolation**: Prevent "noisy neighbor" effects.
+- **极度专业化**：没有 BIOS、没有 PCI 总线、没有传统设备、没有虚拟机迁移、不支持 Windows。每去除一项功能，代码规模、攻击面和资源开销同时降低。
+- **仅四种虚拟设备**：virtio 块设备（约 1400 行 Rust）、virtio 网络（类似规模）、串行控制台（约 250 行）、部分 i8042 PS/2 控制器（不到 50 行）。选择块设备而非文件系统直通，以最小化宿主内核攻击面。
+- **Jailer**：一个次级安全层，在 Firecracker VMM 进程启动客户机之前对其本身进行沙箱处理——使用最少文件的 chroot、PID + 网络命名空间、丢弃权限、24 系统调用 + 30 ioctl 的 seccomp-BPF 白名单。
+- **软分配与超量分配**：CPU 和内存按需分配；测试了高达 20× 的超量分配比率。空闲 MicroVM 仅消耗内存，不消耗 CPU。
+- **利用 Little 法则预热池大小**：使用 `L = λW`（创建速率 × 创建延迟）维护一个小型预启动 MicroVM 池，以隐藏启动延迟。
+- **依赖 Linux，而非重新实现**：调度、内存管理和网络委托给 Linux 宿主内核，使 Firecracker 自身代码库保持精简且可审计。
 
-The fundamental tradeoffs of existing approaches:
+## 与 Shimmy 的关联
 
-- **Linux containers** (cgroups + namespaces + seccomp-BPF): Extremely low overhead but security depends on restricting the syscall surface. Restricting syscalls breaks compatibility; Ubuntu 15.04 needs 224 syscalls + 52 ioctls to run normally.
-- **Traditional virtualization** (QEMU/KVM): Strong isolation via hardware VT-x (security boundary moves from OS interface to hardware), but QEMU has >1.4M lines of code, ~131 MB per-VM memory overhead, hundreds of milliseconds startup — incompatible with serverless density requirements.
-- **Language-level isolation** (V8 isolates, JVM): Cannot run arbitrary Linux binaries; vulnerable to Spectre-class microarchitectural attacks.
+Firecracker 是 AWS Lambda 运行所在的隔离基底，使其成为 Shimmy 所有 Lambda 模式约束的直接背景。Jailer 的 24 系统调用 seccomp-BPF 白名单就是 Shimmy 客户机内核所能看到的——这就是为什么 `ptrace`、`seccomp`、用户命名空间、`chroot` 和 `eBPF` 在 Lambda 内不可用。理解 Firecracker 的架构能从第一原理解释 Shimmy 的约束，而不是将其视为任意限制。
 
-AWS Lambda's original design used one VM per customer with container-based isolation for functions within a VM, requiring unacceptable security/compatibility tradeoffs and inefficient bin packing due to fixed-size VMs.
+本文也为 Shimmy 提供了设计基准：如果 3 MB 开销和 125 ms 冷启动对 Lambda 通用函数来说是可接受的，那么 Shimmy 的专用学生代码沙箱（所需能力更少）可以通过使用更轻量的机制（WASM、rlimits-only）瞄准更低的数字。Firecracker 的软分配模型也验证了 Shimmy 的成本分析：空闲预热沙箱只消耗内存占用，只有当内存成本 < 延迟降低价值时，预热才经济合算。
 
-### Lambda's Six Requirements
+## 详细说明
 
-1. **Isolation**: Defend against broad attack classes including microarchitectural side channels
-2. **Overhead & density**: Run thousands of functions per host with minimal overhead
-3. **Performance**: Near-native, stable, isolated from neighbors
-4. **Compatibility**: Support arbitrary unmodified Linux binaries
-5. **Fast switching**: Millisecond-scale creation and teardown
-6. **Soft allocation**: On-demand resource allocation supporting oversubscription
+### 问题与动机
 
-### Design & Architecture
+> **💡 什么是多租户（multi-tenancy）？**
+> 多租户是指多个客户的代码运行在同一台物理机器上。就像一栋公寓楼里住着不同的租户——每家都有自己的门锁（隔离），但共用同一栋楼（硬件）。多租户对安全隔离的要求极高，因为一个"坏租户"不能影响其他人。
 
-**Device model**:
+无服务器计算和容器依赖多租户——将来自不同客户的工作负载运行在同一硬件上以最大化利用率。多租户需要两种隔离：
 
-| Device | Implementation | Notes |
+1. **安全隔离**：防止一个工作负载访问或推断另一个工作负载的数据，包括防御权限提升、信息泄露和隐蔽信道攻击。
+2. **性能隔离**：防止"嘈杂邻居"效应。
+
+现有方案的根本权衡：
+
+- **Linux 容器**（cgroups + 命名空间 + seccomp-BPF）：开销极低，但安全性依赖于限制系统调用接口。限制系统调用会破坏兼容性；Ubuntu 15.04 正常运行需要 224 个系统调用 + 52 个 ioctl。
+- **传统虚拟化**（QEMU/KVM）：通过硬件 VT-x 提供强隔离（安全边界从 OS 接口移至硬件），但 QEMU 有超过 140 万行代码、每虚拟机约 131 MB 内存开销、数百毫秒启动——与无服务器密度要求不兼容。
+- **语言级隔离**（V8 isolate、JVM）：无法运行任意 Linux 二进制文件；容易受到 Spectre 类微架构攻击。
+
+AWS Lambda 原始设计每个客户使用一个虚拟机，函数之间用容器隔离，导致不可接受的安全/兼容性权衡和因固定大小虚拟机导致的低效装箱。
+
+### Lambda 的六项要求
+
+1. **隔离**：防御广泛的攻击类别，包括微架构侧信道攻击
+2. **开销与密度**：每台宿主机运行数千个函数，开销最小
+3. **性能**：接近原生、稳定、与邻居隔离
+4. **兼容性**：支持任意未修改的 Linux 二进制文件
+5. **快速切换**：毫秒级创建和销毁
+6. **软分配**：按需资源分配，支持超量分配
+
+### 设计与架构
+
+**设备模型**：
+
+| 设备 | 实现 | 备注 |
 |--------|---------------|-------|
-| virtio block | ~1400 lines Rust (incl. MMIO + data structures) | Storage |
-| virtio net | Similar scale | Network |
-| Serial console | ~250 lines Rust | Console output |
-| i8042 (PS/2 controller) | <50 lines Rust | Partial implementation |
+| virtio 块 | 约 1400 行 Rust（含 MMIO + 数据结构） | 存储 |
+| virtio 网络 | 类似规模 | 网络 |
+| 串行控制台 | 约 250 行 Rust | 控制台输出 |
+| i8042（PS/2 控制器） | 不到 50 行 Rust | 部分实现 |
 
-Block device chosen over filesystem passthrough: filesystems are large, complex codebases; exposing only block I/O protects a large portion of the host kernel's attack surface.
+选择块设备而非文件系统直通：文件系统是庞大而复杂的代码库；只暴露块 I/O 能保护宿主内核攻击面的很大一部分。
 
-**Management interface**: Firecracker is configured and controlled via a REST API over a Unix socket. Enables pre-configuration: start the Firecracker process and configure the MicroVM before it is needed, then trigger startup on demand to reduce hot-path latency.
+**管理接口**：Firecracker 通过 Unix 套接字上的 REST API 进行配置和控制。支持预配置：在需要之前启动 Firecracker 进程并配置 MicroVM，然后按需触发启动以降低热路径延迟。
 
-**Rate limiters**: Block and network devices have built-in token-bucket rate limiters (configurable via API) for IOPS, bandwidth, and burst. Implemented in the VMM rather than relying on cgroups because the device emulation layer is the optimal point to control host CPU consumption by guest I/O behavior.
+**速率限制器**：块和网络设备内置令牌桶速率限制器（可通过 API 配置），用于 IOPS、带宽和突发控制。在 VMM 层实现，而非依赖 cgroups，因为设备仿真层是控制客户机 I/O 行为对宿主 CPU 消耗的最优点。
 
-**Security architecture — multi-layer defense**:
+**安全架构——多层防御**：
 
-- **Microarchitectural side-channel mitigations**: Disabled SMT/HyperThreading, enabled KPTI, IBPB, IBRS, L1TF cache flush, SSBD, disabled swap and same-page merging, no shared files (prevent Flush+Reload and Prime+Probe attacks).
-- **Guest kernel hardening**: Nearly all drivers removed; only virtio and serial retained; all features compiled in (no modules); optimized compressed kernel 4.0 MB vs. Ubuntu 18.04's 6.7 MB + 44 MB modules; serial console logging disabled (saves ~70 ms startup time).
+- **微架构侧信道缓解**：禁用 SMT/超线程，启用 KPTI、IBPB、IBRS、L1TF 缓存刷新、SSBD，禁用 swap 和相同页面合并，无共享文件（防止 Flush+Reload 和 Prime+Probe 攻击）。
+- **客户机内核加固**：几乎所有驱动程序已移除；仅保留 virtio 和串行；所有功能编译为内置（无模块）；优化压缩内核 4.0 MB（对比 Ubuntu 18.04 的 6.7 MB + 44 MB 模块）；禁用串行控制台日志（节省约 70 ms 启动时间）。
 
-**Jailer**:
+**Jailer**：
 
-Jailer sandboxes the Firecracker process itself before guest launch:
-- `chroot` containing only the Firecracker binary, `/dev/net/tun`, cgroup control files, and resources for that specific MicroVM
-- PID and network namespace isolation
-- Dropped capabilities
-- seccomp-BPF whitelist: exactly 24 syscalls (each with argument filtering) + 30 ioctls (22 of which are required by the KVM ioctl API)
+Jailer 在客户机启动前对 Firecracker 进程本身进行沙箱处理：
+- chroot 仅包含 Firecracker 二进制、`/dev/net/tun`、cgroup 控制文件和该特定 MicroVM 的资源
+- PID 和网络命名空间隔离
+- 丢弃权限
+- seccomp-BPF 白名单：恰好 24 个系统调用（每个带参数过滤）+ 30 个 ioctl（其中 22 个是 KVM ioctl API 所需）
 
-**Lambda production architecture**:
-
-```
-Frontend (stateless) → Worker Manager (stateful router) → Placement Service
-                                                         ↓
-                                                   Workers (each runs hundreds–thousands of MicroVMs)
-```
-
-- **Worker Manager**: Custom high-throughput (<10 ms p99.9) stateful router performing sticky routing of same-function invocations to minimize cold starts.
-- **Placement Service**: Global optimizer for slot placement across the worker fleet; time-based lease protocol.
-- **MicroManager**: One process per worker, manages all Firecracker processes; maintains a small pre-started MicroVM pool.
-- **Lambda Shim**: Control process inside each MicroVM; communicates with MicroManager via TCP/IP.
-
-**Slot lifecycle**:
+**Lambda 生产架构**：
 
 ```
-Init → Idle ↔ Busy → Dead (after max 12 hours)
+前端（无状态）→ 工作器管理器（有状态路由器）→ 放置服务
+                                                    ↓
+                                    工作器（每台运行数百至数千个 MicroVM）
 ```
 
-Idle slots consume only memory; busy slots additionally consume CPU, cache, and network/memory bandwidth. Memory accounts for ~40% of typical server capital cost, so idle slots cost approximately 40% of busy slots.
+- **工作器管理器**：自定义高吞吐量（p99.9 延迟 < 10 ms）有状态路由器，对同一函数的调用进行粘性路由以最小化冷启动。
+- **放置服务**：跨工作器机群的全局槽位放置优化器；基于时间的租约协议。
+- **MicroManager**：每台工作器一个进程，管理所有 Firecracker 进程；维护小型预启动 MicroVM 池。
+- **Lambda Shim**：每个 MicroVM 内部的控制进程；通过 TCP/IP 与 MicroManager 通信。
 
-**Pool sizing**: Using Little's Law (`L = λW`), at 125 ms startup latency and 8 MicroVM/sec creation rate, only 1 pre-started MicroVM is needed. This makes pre-warming economically efficient.
+**槽位生命周期**：
 
-### Evaluation
+```
+初始化 → 空闲 ↔ 忙碌 → 死亡（最多 12 小时后）
+```
 
-**Hardware**: EC2 m5d.metal, 2× Intel Xeon Platinum 8175M (48 cores, SMT disabled), 384 GB RAM, 4× 840 GB NVMe SSD, Ubuntu 18.04, Linux 4.15.0. Compared against Firecracker v0.20.0, QEMU v4.2.0 (minimal static build), and Intel Cloud Hypervisor.
+空闲槽位仅消耗内存；忙碌槽位额外消耗 CPU、缓存和网络/内存带宽。内存约占典型服务器资本成本的 40%，因此空闲槽位成本约为忙碌槽位的 40%。
 
-**Startup latency** (serial, 500 samples):
+> **💡 什么是 Little 法则？**
+> Little 法则是排队论的核心结论：系统中平均存在的任务数 L = 到达速率 λ × 每个任务在系统中的平均时间 W。在 Firecracker 的语境下：需要预热的 MicroVM 数量 = 每秒创建请求数 × 每次创建耗时。125 ms 启动时间 + 每秒 8 个请求 = 只需预热 1 个 MicroVM。
 
-| VMM | Median startup time | Notes |
+**池大小**：使用 Little 法则（`L = λW`），在 125 ms 启动延迟和每秒创建 8 个 MicroVM 的情况下，只需要 1 个预启动 MicroVM。这使预热在经济上高效。
+
+### 评估
+
+**硬件**：EC2 m5d.metal，2× Intel Xeon Platinum 8175M（48 核，禁用 SMT），384 GB RAM，4× 840 GB NVMe SSD，Ubuntu 18.04，Linux 4.15.0。与 Firecracker v0.20.0、QEMU v4.2.0（最小静态构建）和 Intel Cloud Hypervisor 对比。
+
+**启动延迟**（串行，500 个样本）：
+
+| VMM | 中位启动时间 | 备注 |
 |-----|--------------------|----|
-| Firecracker (pre-configured) | ~60 ms | API-triggered to init execution |
-| Cloud Hypervisor | ~65 ms | Slightly slower than pre-configured FC |
-| Firecracker (end-to-end) | ~80 ms | Including fork + API configuration |
-| QEMU | ~120 ms+ | Including qboot minimal BIOS |
+| Firecracker（预配置）| 约 60 ms | API 触发到初始化执行 |
+| Cloud Hypervisor | 约 65 ms | 略慢于预配置 FC |
+| Firecracker（端到端）| 约 80 ms | 含 fork + API 配置 |
+| QEMU | 约 120 ms+ | 含 qboot 最小 BIOS |
 
-Parallel launch of 1000 MicroVMs (50 concurrent): pre-configured Firecracker p99 = 146 ms; 100 concurrent: p99 = 153 ms.
+并发启动 1000 个 MicroVM（50 并发）：预配置 Firecracker p99 = 146 ms；100 并发：p99 = 153 ms。
 
-Startup cost contributors:
-- Compressed kernel decompression: +40 ms
-- Ubuntu 18.04 default kernel: +~900 ms (legacy device probing + unused driver loading)
-- Adding a network interface: +20 ms (FC/Cloud HV) or +35 ms (QEMU)
+启动成本贡献因素：
+- 压缩内核解压缩：+40 ms
+- Ubuntu 18.04 默认内核：+~900 ms（传统设备探测 + 未使用驱动加载）
+- 添加网络接口：+20 ms（FC/Cloud HV）或 +35 ms（QEMU）
 
-**Memory overhead**:
+**内存开销**：
 
-| VMM | Per-VM memory overhead | Notes |
+| VMM | 每虚拟机内存开销 | 备注 |
 |-----|----------------------|-------|
-| Firecracker | ~3 MB | Constant regardless of VM RAM size |
-| Cloud Hypervisor | ~13 MB | Constant |
-| QEMU | ~131 MB | Roughly constant |
+| Firecracker | 约 3 MB | 与虚拟机 RAM 大小无关 |
+| Cloud Hypervisor | 约 13 MB | 固定 |
+| QEMU | 约 131 MB | 近似固定 |
 
-For a 128 MB Lambda function, QEMU imposes >100% memory overhead; Firecracker ~2.3%.
+对于 128 MB 的 Lambda 函数，QEMU 带来超过 100% 的内存开销；Firecracker 约 2.3%。
 
-**Block I/O** (fio, random I/O, queue depth 32, local NVMe):
-- Firecracker 4 KB read IOPS: ~13,000 vs. bare-metal >340,000 — limited by serial I/O handling.
-- 4 KB write: high (no flush-to-disk implemented at time of paper).
-- 4 KB read p99 latency: Firecracker only 49 μs above bare-metal at queue depth 1.
+**块 I/O**（fio，随机 I/O，队列深度 32，本地 NVMe）：
+- Firecracker 4 KB 读 IOPS：约 13,000（对比裸机 >340,000）——受串行 I/O 处理限制。
+- 4 KB 读 p99 延迟：队列深度 1 时 Firecracker 仅比裸机高 49 μs。
 
-**Network I/O** (iperf3, TAP interface, MTU 1500):
+**网络 I/O**（iperf3，TAP 接口，MTU 1500）：
 
-| VMM | Single-stream RX (Gb/s) | Single-stream TX (Gb/s) |
+| VMM | 单流 RX（Gb/s）| 单流 TX（Gb/s）|
 |-----|------------------------|------------------------|
-| Bare-metal loopback | 44.14 | 44.14 |
+| 裸机环回 | 44.14 | 44.14 |
 | Firecracker | 15.61 | 14.15 |
 | Cloud Hypervisor | 23.12 | 20.96 |
 | QEMU | 23.76 | 20.43 |
 
-Firecracker network throughput is lower than Cloud Hypervisor and QEMU but has not been a bottleneck in production.
+Firecracker 网络吞吐量低于 Cloud Hypervisor 和 QEMU，但在生产中未成为瓶颈。
 
-**Oversubscription**: Tested at up to 20× oversubscription; production deployments use up to 10×.
+**超量分配**：测试了高达 20× 的超量分配；生产部署使用高达 10×。
 
-### Production Deployment
+### 生产部署
 
-Migration from old Lambda architecture (one EC2 instance per customer + containers per function) to Firecracker on EC2 bare-metal instances began in 2018.
+从旧 Lambda 架构（每个客户一个 EC2 实例 + 每个函数容器隔离）迁移到 EC2 裸机实例上运行 Firecracker 于 2018 年开始。
 
-Key operational lessons:
-- Disabling SMT changed timing behavior, exposing subtle bugs in AWS SDK and Apache Commons HttpClient.
-- DNS queries not cached inside MicroVMs caused performance issues.
-- Immutable infrastructure model: patches applied by terminating and restarting EC2 instances with updated AMIs, not in-place updates.
-- Rolling migration: used the 12-hour slot maximum lifetime to gradually shift slots from old to new architecture with no customer disruption.
+关键运营经验：
+- 禁用 SMT 改变了时序行为，暴露了 AWS SDK 和 Apache Commons HttpClient 中的细微 bug。
+- MicroVM 内部未缓存 DNS 查询导致性能问题。
+- 不可变基础设施模型：通过用更新的 AMI 终止并重启 EC2 实例来应用补丁，而非就地更新。
+- 滚动迁移：利用 12 小时槽位最大生存时间，将槽位从旧架构逐渐转移到新架构，对客户零影响。
 
-### Limitations
+### 局限
 
-1. **Block I/O performance gap**: Serial I/O handling and no flush-to-disk limit throughput and durability guarantees.
-2. **Network throughput**: ~1/3 of bare-metal; not a bottleneck in Lambda/Fargate workloads but limits IO-intensive applications.
-3. **No PCI passthrough**: virtio cannot reach bare-metal I/O performance; hardware doesn't support passthrough for thousands of short-lived VMs.
-4. **Extreme feature removal costs generality**: No Windows, no VM migration, no legacy devices.
-5. **Linux host dependency**: Tightly coupled to Linux KVM, process scheduler, memory manager, and networking stack.
-6. **SMT disabling**: Costs ~50% of thread-level parallelism; a hard production requirement for side-channel defense.
+1. **块 I/O 性能差距**：串行 I/O 处理和无刷盘限制了吞吐量和持久性保证。
+2. **网络吞吐量**：约为裸机的 1/3；对 Lambda/Fargate 工作负载不是瓶颈，但限制了 I/O 密集型应用。
+3. **无 PCI 直通**：virtio 无法达到裸机 I/O 性能；硬件不支持对数千个短期虚拟机的直通。
+4. **极度去功能化牺牲通用性**：不支持 Windows、不支持虚拟机迁移、不支持传统设备。
+5. **Linux 宿主机依赖**：与 Linux KVM、进程调度器、内存管理器和网络栈紧密耦合。
+6. **禁用 SMT**：消耗约 50% 的线程级并行性；这是防御侧信道攻击的硬性生产要求。
 
-### Glossary
+### 术语表
 
-- **VMM (Virtual Machine Monitor)**: Software layer that creates and manages VMs, provides device emulation, handles VM exits
-- **MicroVM**: Firecracker's lightweight VM, optimized for serverless workloads
-- **KVM (Kernel-based Virtual Machine)**: Linux kernel's virtualization infrastructure using Intel VT-x / AMD-V hardware extensions
-- **virtio**: Open paravirtualization device standard for efficient I/O in virtual machines
-- **MMIO (Memory-Mapped I/O)**: Firecracker exposes virtio devices via MMIO rather than a PCI bus
-- **Jailer**: Firecracker's outer security sandbox wrapper; contains the VMM process itself
-- **Slot**: A function execution environment unit on a Lambda worker; one slot = one MicroVM
-- **Soft allocation**: On-demand resource allocation with oversubscription (CPU/memory allocated when needed, not pre-reserved)
-- **Sticky routing**: Routing same-function invocations to the same worker to maximize warm cache hits
-- **SMT (Symmetric MultiThreading)**: Hyperthreading; disabled in Firecracker production deployments as a side-channel mitigation
-- **TCB (Trusted Computing Base)**: The minimal set of code the system's security depends on
-- **Little's Law**: Queuing theory result: average queue length L = arrival rate λ × average time in system W
+- **VMM（虚拟机监视器）**：创建和管理虚拟机、提供设备仿真、处理虚拟机退出的软件层
+- **MicroVM**：Firecracker 的轻量级虚拟机，针对无服务器工作负载优化
+- **KVM（Kernel-based Virtual Machine）**：Linux 内核的虚拟化基础设施，使用 Intel VT-x / AMD-V 硬件扩展
+- **virtio**：用于虚拟机中高效 I/O 的开放半虚拟化设备标准
+- **MMIO（内存映射 I/O）**：Firecracker 通过 MMIO 而非 PCI 总线暴露 virtio 设备
+- **Jailer**：Firecracker 的外层安全沙箱包装器；包含 VMM 进程本身
+- **槽位（Slot）**：Lambda 工作器上的函数执行环境单元；一个槽位 = 一个 MicroVM
+- **软分配（Soft allocation）**：按需资源分配，支持超量分配（CPU/内存在需要时分配，不预留）
+- **粘性路由（Sticky routing）**：将同一函数的调用路由到同一工作器以最大化暖缓存命中
+- **SMT（对称多线程）**：超线程；Firecracker 生产部署中作为侧信道缓解措施而禁用
+- **TCB（可信计算基）**：系统安全所依赖的最小代码集合
+- **Little 法则**：排队论结论：平均队列长度 L = 到达速率 λ × 系统中平均时间 W
